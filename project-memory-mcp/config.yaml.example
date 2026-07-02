@@ -1,0 +1,60 @@
+# Example Project Memory MCP Configuration (YAML)
+# Copy this to config.yaml and customize for your project
+
+project:
+  root: "."
+  memory_dir: ".project-memory"
+
+database:
+  path: ".project-memory/project_knowledge.db"
+  echo: false
+
+llm:
+  mode: "agent_driven"  # or "server_driven"
+  provider: "anthropic"  # anthropic, openai, google
+  api_key: "${ANTHROPIC_API_KEY}"
+  model: "claude-3-5-sonnet-20241022"
+  temperature: 0.1
+
+analysis:
+  use_vector_similarity: false
+  max_analysis_depth: 3
+
+safety:
+  require_impact_analysis_before_edit: true
+  require_confirmation_before_delete: true
+  preserve_comments: true
+  preserve_commented_code: true
+
+exclude_patterns:
+  - ".git"
+  - "node_modules"
+  - "__pycache__"
+  - ".venv"
+  - "venv"
+  - "env"
+  - "build"
+  - "dist"
+  - "target"
+  - "*.egg-info"
+  - ".tox"
+  - ".idea"
+  - ".vscode"
+  - "*.pyc"
+  - "*.log"
+  - "*.tmp"
+
+languages:
+  - "python"
+  - "typescript"
+  - "javascript"
+  - "rust"
+  - "go"
+  - "java"
+  - "c"
+  - "cpp"
+
+workflow:
+  auto_index: true
+  auto_build_graph: true
+  auto_generate_manual: true
