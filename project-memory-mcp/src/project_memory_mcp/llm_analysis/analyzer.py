@@ -145,8 +145,19 @@ class LLMAnalyzer:
         """
         Create an analysis task for agent-driven mode.
 
+        In agent-driven mode the MCP server does NOT format the user prompt here:
+        the full prompt bundle (system + user + schema) is only materialized when
+        the agent asks for the next task via ``get_next_analysis_task`` (see
+        ``mcp_tools.memory._build_analysis_task_output``), which has access to the
+        source code and a fresh static analysis. Formatting the template now would
+        require ``{language}``/``{source_code}`` placeholders that the caller does
+        not (and should not) provide at queueing time, raising ``KeyError``.
+
+        This method therefore only records the task metadata needed to persist a
+        PENDING ``LLMAnalysisRecord``; the prompt is formatted lazily on demand.
+
         Returns:
-            Dictionary with task info and formatted prompt
+            Dictionary with task info (user_prompt left empty until requested).
         """
         prompt_name = f"analyze_{task_type}"
         template = self.get_prompt(prompt_name)
@@ -154,14 +165,12 @@ class LLMAnalyzer:
         if not template:
             raise ValueError(f"No prompt template for task type: {task_type}")
 
-        # Build context for the prompt
+        # Build context metadata for hashing only — do NOT format the template.
         prompt_context = context or {}
         prompt_context.setdefault("task_id", task_id)
         prompt_context.setdefault("task_type", task_type)
         prompt_context.setdefault("target_path", target_path)
         prompt_context.setdefault("target_name", target_name)
-
-        formatted_prompt = self.format_prompt(prompt_name, **prompt_context)
 
         return {
             "task_id": task_id,
@@ -171,7 +180,7 @@ class LLMAnalyzer:
             "prompt_name": prompt_name,
             "prompt_version": template.version,
             "system_prompt": template.system_prompt,
-            "user_prompt": formatted_prompt,
+            "user_prompt": "",
             "output_schema": template.output_schema,
             "context_hash": self._hash_context(prompt_context),
         }
@@ -279,6 +288,7 @@ class LLMAnalyzer:
             return response
         except Exception as e:
             logger.error(f"LLM analysis failed: {e}")
+            print(f"[analyzer._single_analysis] LLM call failed: {e}", flush=True)
             return None
 
     def _aggregate_results(self, results: list[BaseModel], schema_class: type[BaseModel]) -> BaseModel:

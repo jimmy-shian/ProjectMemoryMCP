@@ -215,11 +215,11 @@ Use it in conjunction with the Project Memory MCP tools to query, modify, and ma
         query_equations_info = self._generate_query_equations_info(data)
 
         # Safety sections
-        safety_modify_info = self._generate_safety_modify_info()
-        safety_delete_info = self._generate_safety_delete_info()
+        safety_modify_info = self._generate_safety_modify_info(data)
+        safety_delete_info = self._generate_safety_delete_info(data)
 
         # After changes
-        after_changes_info = self._generate_after_changes_info()
+        after_changes_info = self._generate_after_changes_info(data)
 
         # Recommended queries
         recommended_queries = self._generate_recommended_queries(data)

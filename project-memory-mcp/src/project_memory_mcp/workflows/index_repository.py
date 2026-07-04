@@ -165,20 +165,28 @@ class IndexRepositoryWorkflow:
                 session.add(file_record)
                 await session.flush()
 
-            self.file_map[file_info.relative_path] = file_record
+            self.file_map[file_info.relative_path] = {  # type: ignore[assignment]
+                "id": file_record.id,
+                "path": file_record.path,
+                "filename": file_record.filename,
+                "language": file_record.language,
+                "is_source": file_record.is_source,
+            }
             results["files_indexed"] += 1
 
             # Extract static structure for source files
             if file_info.is_source and file_info.language:
-                await self._extract_static_structure(file_record, file_info, session)
+                await self._extract_static_structure(file_record, file_info, session, results)
 
     async def _extract_static_structure(
         self,
         file_record: File,
         file_info,
         session,
+        results: dict[str, Any],
     ) -> None:
         """Extract symbols, imports, calls using tree-sitter."""
+        new_symbol_ids: list[int] = []
         try:
             analysis = self.locator.analyze_file(file_info.path)
 
@@ -198,7 +206,14 @@ class IndexRepositoryWorkflow:
                 )
                 session.add(symbol)
                 await session.flush()
-                self.symbol_map[func.qualified_name] = symbol
+                self.symbol_map[func.qualified_name] = {
+                    "id": symbol.id,
+                    "name": symbol.name,
+                    "qualified_name": symbol.qualified_name,
+                    "symbol_type": "function",
+                    "file_id": symbol.file_id,
+                }
+                new_symbol_ids.append(symbol.id)
                 results["symbols_extracted"] += 1
 
             for cls in analysis.classes:
@@ -215,7 +230,14 @@ class IndexRepositoryWorkflow:
                 )
                 session.add(symbol)
                 await session.flush()
-                self.symbol_map[cls.qualified_name] = symbol
+                self.symbol_map[cls.qualified_name] = {
+                    "id": symbol.id,
+                    "name": symbol.name,
+                    "qualified_name": symbol.qualified_name,
+                    "symbol_type": "class",
+                    "file_id": symbol.file_id,
+                }
+                new_symbol_ids.append(symbol.id)
                 results["symbols_extracted"] += 1
 
             for var in analysis.variables:
@@ -231,11 +253,22 @@ class IndexRepositoryWorkflow:
                 )
                 session.add(symbol)
                 await session.flush()
-                self.symbol_map[var.qualified_name] = symbol
+                self.symbol_map[var.qualified_name] = {
+                    "id": symbol.id,
+                    "name": symbol.name,
+                    "qualified_name": symbol.qualified_name,
+                    "symbol_type": "variable",
+                    "file_id": symbol.file_id,
+                }
+                new_symbol_ids.append(symbol.id)
                 results["symbols_extracted"] += 1
 
-            # Create GraphEdges for static relationships
-            await self._create_static_edges(file_record, analysis, session)
+            # Create GraphEdges for static relationships (best-effort;
+            # duplicate edges are skipped individually instead of rolling back
+            # the whole file's symbols).
+            await self._create_static_edges(
+                file_record, analysis, session, new_symbol_ids
+            )
 
             # Detect equations
             await self._detect_equations(file_record, analysis, session, results)
@@ -248,28 +281,45 @@ class IndexRepositoryWorkflow:
         file_record: File,
         analysis,
         session,
+        new_symbol_ids: list[int] | None = None,
     ) -> None:
-        """Create graph edges from static analysis."""
-        # File -> Symbol edges (CONTAINS/DEFINES)
-        for symbol_name, symbol in self.symbol_map.items():
-            if symbol.file_id == file_record.id:
-                edge = GraphEdge(
-                    source_type="file",
-                    source_id=file_record.id,
-                    target_type="symbol",
-                    target_id=symbol.id,
-                    edge_type="DEFINES",
-                    evidence="tree-sitter static analysis",
-                    confidence=1.0,
-                    created_by="static_locator",
-                )
-                session.add(edge)
+        """Create graph edges from static analysis.
 
-        # Import edges
-        for imp in analysis.imports:
+        ``new_symbol_ids`` restricts the DEFINES edges to the symbols created in
+        the current ``_extract_static_structure`` call, so we never re-emit edges
+        for symbols that were already persisted for earlier files (which would
+        trip the graph_edges UNIQUE constraint and rollback the symbols).
+        """
+        file_id = file_record.id
+
+        # File -> Symbol edges (DEFINES) only for symbols newly created this file.
+        for symbol_id in new_symbol_ids or []:
             edge = GraphEdge(
                 source_type="file",
-                source_id=file_record.id,
+                source_id=file_id,
+                target_type="symbol",
+                target_id=symbol_id,
+                edge_type="DEFINES",
+                evidence="tree-sitter static analysis",
+                confidence=1.0,
+                created_by="static_locator",
+            )
+            try:
+                async with session.begin_nested():
+                    session.add(edge)
+            except Exception:
+                pass
+
+        # Import edges (dedup by module name within this file)
+        seen_imports: set[str] = set()
+        for imp in analysis.imports:
+            key = f"IMPORTS:{imp.name}"
+            if key in seen_imports:
+                continue
+            seen_imports.add(key)
+            edge = GraphEdge(
+                source_type="file",
+                source_id=file_id,
                 target_type="file",
                 target_id=0,  # Will be resolved later
                 edge_type="IMPORTS",
@@ -277,17 +327,25 @@ class IndexRepositoryWorkflow:
                 confidence=1.0,
                 created_by="static_locator",
             )
-            session.add(edge)
+            try:
+                async with session.begin_nested():
+                    session.add(edge)
+            except Exception:
+                pass
 
-        # Call edges
+        # Call edges (dedup by caller+callname within this file)
+        seen_calls: set[str] = set()
         for call in analysis.calls:
-            # Find caller symbol
             caller = self._find_enclosing_symbol(call, analysis)
             if caller and caller.qualified_name in self.symbol_map:
                 caller_symbol = self.symbol_map[caller.qualified_name]
+                ckey = f"CALLS:{caller_symbol['id']}:{call.name}"
+                if ckey in seen_calls:
+                    continue
+                seen_calls.add(ckey)
                 edge = GraphEdge(
                     source_type="symbol",
-                    source_id=caller_symbol.id,
+                    source_id=caller_symbol["id"],
                     target_type="symbol",
                     target_id=0,  # Will be resolved later
                     edge_type="CALLS",
@@ -295,7 +353,11 @@ class IndexRepositoryWorkflow:
                     confidence=0.8,
                     created_by="static_locator",
                 )
-                session.add(edge)
+                try:
+                    async with session.begin_nested():
+                        session.add(edge)
+                except Exception:
+                    pass
 
     def _find_enclosing_symbol(self, call_entity, analysis) -> Optional:
         """Find the symbol that encloses a call."""
@@ -344,28 +406,52 @@ class IndexRepositoryWorkflow:
                 )
                 session.add(equation)
                 await session.flush()
-                self.equation_map[func.name] = equation
+                self.equation_map[func.name] = {
+                    "id": equation.id,
+                    "name": equation.name,
+                    "file_id": equation.file_id,
+                }
                 results["equations_found"] += 1
 
     async def _create_analysis_tasks(self, results: dict[str, Any]) -> None:
-        """Create LLM analysis tasks for agent-driven mode."""
+        """Create LLM analysis tasks for agent-driven mode.
+
+        File/Symbol/Equation records are detached from any live session by the
+        time we get here (each was flushed inside its own ``get_session()``
+        block), so we re-query them inside a single fresh session to avoid
+        ``DetachedInstanceError`` when reading ``is_source``/``id``/``path``.
+        """
+        from sqlalchemy import select
+
         tasks_created = 0
 
-        # File-level analysis tasks
-        for file_record in self.file_map.values():
-            if file_record.is_source:
+        async with get_session() as session:
+            # File-level analysis tasks
+            file_rows = (
+                await session.execute(
+                    select(File).where(File.is_source == True)  # noqa: E712
+                )
+            ).scalars().all()
+            for file_record in file_rows:
                 task = self.analyzer.create_analysis_task(
                     task_id=f"file_{file_record.id}",
                     task_type="file",
                     target_path=file_record.path,
                     context={"file_id": file_record.id},
                 )
-                await self._store_analysis_task(task)
+                record = self._build_analysis_record(task)
+                session.add(record)
                 tasks_created += 1
 
-        # Symbol-level analysis tasks
-        for symbol_name, symbol in self.symbol_map.items():
-            if symbol.symbol_type in ("function", "method", "class"):
+            # Symbol-level analysis tasks
+            symbol_rows = (
+                await session.execute(
+                    select(Symbol).where(
+                        Symbol.symbol_type.in_(["function", "method", "class"])
+                    )
+                )
+            ).scalars().all()
+            for symbol in symbol_rows:
                 task = self.analyzer.create_analysis_task(
                     task_id=f"symbol_{symbol.id}",
                     task_type="symbol",
@@ -373,38 +459,39 @@ class IndexRepositoryWorkflow:
                     target_name=symbol.name,
                     context={"symbol_id": symbol.id, "file_id": symbol.file_id},
                 )
-                await self._store_analysis_task(task)
+                record = self._build_analysis_record(task)
+                session.add(record)
                 tasks_created += 1
 
-        # Equation-level analysis tasks
-        for eq_name, equation in self.equation_map.items():
-            task = self.analyzer.create_analysis_task(
-                task_id=f"equation_{equation.id}",
-                task_type="equation",
-                target_path=equation.name,
-                target_name=eq_name,
-                context={"equation_id": equation.id, "file_id": equation.file_id},
-            )
-            await self._store_analysis_task(task)
-            tasks_created += 1
+            # Equation-level analysis tasks
+            equation_rows = (await session.execute(select(Equation))).scalars().all()
+            for equation in equation_rows:
+                task = self.analyzer.create_analysis_task(
+                    task_id=f"equation_{equation.id}",
+                    task_type="equation",
+                    target_path=equation.name,
+                    target_name=equation.name,
+                    context={"equation_id": equation.id, "file_id": equation.file_id},
+                )
+                record = self._build_analysis_record(task)
+                session.add(record)
+                tasks_created += 1
 
         results["analysis_tasks_created"] = tasks_created
 
-    async def _store_analysis_task(self, task: dict[str, Any]) -> None:
-        """Store an analysis task in the database."""
-        async with get_session() as session:
-            record = LLMAnalysisRecord(
-                target_type=task["task_type"],
-                target_id=int(task["task_id"].split("_")[-1]),
-                prompt_name=task["prompt_name"],
-                prompt_version=task["prompt_version"],
-                model_name=self.config.get("llm_model", "unknown"),
-                input_context_hash=task["context_hash"],
-                output_json="{}",  # Will be filled when agent submits
-                confidence=0.0,
-                status=AnalysisStatus.PENDING.value,
-            )
-            session.add(record)
+    def _build_analysis_record(self, task: dict[str, Any]) -> LLMAnalysisRecord:
+        """Build an LLMAnalysisRecord row from a task dict."""
+        return LLMAnalysisRecord(
+            target_type=task["task_type"],
+            target_id=int(task["task_id"].split("_")[-1]),
+            prompt_name=task["prompt_name"],
+            prompt_version=task["prompt_version"],
+            model_name=self.config.get("llm_model", "unknown"),
+            input_context_hash=task["context_hash"],
+            output_json="{}",  # Will be filled when agent submits
+            confidence=0.0,
+            status=AnalysisStatus.PENDING.value,
+        )
 
     async def _build_graph_edges(self) -> None:
         """Build complete graph edges from static and LLM analysis."""
@@ -420,9 +507,9 @@ class IndexRepositoryWorkflow:
                 # Try to find target file by module name
                 evidence = edge.evidence or ""
                 module_name = evidence.replace("Import: ", "").strip()
-                target_file = self._resolve_import(module_name)
-                if target_file:
-                    edge.target_id = target_file.id
+                target_file_id = self._resolve_import(module_name)
+                if target_file_id:
+                    edge.target_id = target_file_id
                     edge.confidence = 0.9
 
             # Resolve call edges to actual symbol IDs
@@ -435,21 +522,21 @@ class IndexRepositoryWorkflow:
                 called_name = evidence.replace("Call to ", "").strip()
                 target_symbol = self.symbol_map.get(called_name)
                 if target_symbol:
-                    edge.target_id = target_symbol.id
+                    edge.target_id = target_symbol["id"]
                     edge.confidence = 0.9
 
             # Add LLM-derived edges
             await self._add_llm_derived_edges(session)
 
-    def _resolve_import(self, module_name: str) -> File | None:
-        """Resolve an import module name to a File record."""
+    def _resolve_import(self, module_name: str) -> int | None:
+        """Resolve an import module name to a File id (plain int)."""
         # Try direct path match
         for file_record in self.file_map.values():
-            if file_record.path.replace("/", ".").replace(".py", "") == module_name:
-                return file_record
+            if file_record["path"].replace("/", ".").replace(".py", "") == module_name:
+                return file_record["id"]
             # Try with just the filename
-            if file_record.filename.replace(".py", "") == module_name.rsplit(".", maxsplit=1)[-1]:
-                return file_record
+            if file_record["filename"].replace(".py", "") == module_name.rsplit(".", maxsplit=1)[-1]:
+                return file_record["id"]
         return None
 
     async def _add_llm_derived_edges(self, session) -> None:

@@ -79,7 +79,13 @@ class StaticLocator:
             return None
 
     def _get_queries(self, language: str) -> dict[str, Query]:
-        """Get or create queries for the given language."""
+        """Get or create queries for the given language.
+
+        Each query is compiled independently so that a single unsupported node
+        type (e.g. ``async_function_definition`` with a grammar/ABI mismatch) only
+        drops that one query instead of failing the whole language batch — which
+        previously caused ``return {}`` and zero symbol extraction for the file.
+        """
         if language in self._queries:
             return self._queries[language]
 
@@ -87,23 +93,30 @@ class StaticLocator:
         if not lang_info:
             return {}
 
+        queries: dict[str, Query] = {}
+
         try:
             module = __import__(lang_info.tree_sitter_module)
             ts_language = Language(module.language())
-
-            queries = {}
-            available_queries = get_all_queries_for_language(language)
-
-            for query_type in available_queries:
-                query_str = get_query(language, query_type)
-                if query_str:
-                    queries[query_type] = Query(ts_language, query_str)
-
+        except Exception as e:
+            print(f"Failed to load language for {language}: {e}")
             self._queries[language] = queries
             return queries
-        except Exception as e:
-            print(f"Failed to create queries for {language}: {e}")
-            return {}
+
+        available_queries = get_all_queries_for_language(language)
+
+        for query_type in available_queries:
+            query_str = get_query(language, query_type)
+            if not query_str:
+                continue
+            try:
+                queries[query_type] = Query(ts_language, query_str)
+            except Exception as e:
+                # Skip only this query type; keep compiling the rest.
+                print(f"Skipping {language} query '{query_type}': {e}")
+
+        self._queries[language] = queries
+        return queries
 
     def analyze_file(self, file_path: str) -> FileAnalysis:
         """
