@@ -87,6 +87,8 @@ def index(
     console.print(f"[bold blue]Indexing repository: {project_path}[/bold blue]")
 
     async def run():
+        from project_memory_mcp.db.connection import init_db
+        await init_db()
         config_dict = _load_config_if_provided(config)
         result = await index_repository(project_path, config_dict)
         console.print(f"[green]✓[/green] Completed: {result}")
@@ -103,6 +105,8 @@ def rescan(
     console.print(f"[bold blue]Rescanning changed files in: {project_path}[/bold blue]")
 
     async def run():
+        from project_memory_mcp.db.connection import init_db
+        await init_db()
         config_dict = _load_config_if_provided(config)
         result = await rescan_changed_files(project_path)
         console.print(f"[green]✓[/green] Files checked: {result.get('files_checked', 0)}")
@@ -153,6 +157,8 @@ def query_file(
     console.print(f"[bold blue]Querying file: {file_path}[/bold blue]")
 
     async def run():
+        from project_memory_mcp.db.connection import init_db
+        await init_db()
         from project_memory_mcp.mcp_tools.query import project_query_file
         result = await project_query_file(QueryFileInput(
             project_path=project_path,
@@ -203,6 +209,8 @@ def query_symbol(
     console.print(f"[bold blue]Querying symbol: {symbol_name}[/bold blue]")
 
     async def run():
+        from project_memory_mcp.db.connection import init_db
+        await init_db()
         from project_memory_mcp.mcp_tools.query import project_query_symbol
         result = await project_query_symbol(QuerySymbolInput(
             project_path=project_path,
@@ -242,6 +250,8 @@ def query_equation(
     console.print(f"[bold blue]Querying equations with keyword: {keyword}[/bold blue]")
 
     async def run():
+        from project_memory_mcp.db.connection import init_db
+        await init_db()
         from project_memory_mcp.mcp_tools.query import project_query_equation
         result = await project_query_equation(QueryEquationInput(
             project_path=project_path,
@@ -277,6 +287,8 @@ def impact(
     console.print(f"[bold blue]Impact analysis for {target_type}: {target_name}[/bold blue]")
 
     async def run():
+        from project_memory_mcp.db.connection import init_db
+        await init_db()
         result = await query_impact(
             target_type=target_type,
             target_name=target_name,
@@ -305,6 +317,8 @@ def manual(
     console.print(f"[bold blue]Generating manual for: {project_path}[/bold blue]")
 
     async def run():
+        from project_memory_mcp.db.connection import init_db
+        await init_db()
         config_dict = _load_config_if_provided(config)
         result = await generate_manual(project_path)
         console.print(f"[green]✓[/green] Manual generated with {result.get('sections', 0)} sections")

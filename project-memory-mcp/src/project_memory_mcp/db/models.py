@@ -143,6 +143,8 @@ class File(Base):
     purpose: Mapped[str | None] = mapped_column(Text, nullable=True)
     llm_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     llm_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    key_concepts: Mapped[str | None] = mapped_column(Text, nullable=True)
+    risk_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     analysis_status: Mapped[str] = mapped_column(
         String(50), default=AnalysisStatus.PENDING.value
     )
@@ -180,7 +182,7 @@ class Symbol(Base):
         Integer, ForeignKey("symbols.id", ondelete="SET NULL"), nullable=True, index=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    qualified_name: Mapped[str | None] = mapped_column(String(500), nullable=True, index=True)
+    qualified_name: Mapped[str | None] = mapped_column(String(500), nullable=True)
     symbol_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     visibility: Mapped[str | None] = mapped_column(String(50), nullable=True)
     signature: Mapped[str | None] = mapped_column(Text, nullable=True)

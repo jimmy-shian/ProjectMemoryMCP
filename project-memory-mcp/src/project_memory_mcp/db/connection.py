@@ -4,6 +4,7 @@ import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -100,6 +101,12 @@ async def init_db(
         # Create all tables - checkfirst=True to avoid errors on existing tables
         await conn.run_sync(lambda sync_conn: Base.metadata.create_all(sync_conn, checkfirst=True))
 
+    # For pre-existing databases created before new optional columns were added,
+    # ensure those columns exist. CREATE TABLE only covers fresh DBs; SQLite needs
+    # ALTER TABLE here so already-initialized projects can use new fields without a
+    # full re-index. Unknown/new columns are simply skipped when already present.
+    await _ensure_optional_columns(_engine)
+
     _session_factory = async_sessionmaker(
         _engine,
         class_=AsyncSession,
@@ -117,6 +124,45 @@ async def close_db() -> None:
         await _engine.dispose()
         _engine = None
         _session_factory = None
+
+
+async def _ensure_optional_columns(engine: AsyncEngine) -> None:
+    """Add columns added in later versions to existing SQLite tables.
+
+    ``Base.metadata.create_all(checkfirst=True)`` only creates missing tables; it
+    cannot add columns to an existing table. This helper introspects each table
+    with ``PRAGMA table_info`` and runs ``ALTER TABLE ... ADD COLUMN`` for any
+    optional columns that are defined on the model but absent in the DB. Safe to
+    run repeatedly: existing columns are detected and skipped.
+    """
+    optional_columns: dict[str, list[tuple[str, str]]] = {
+        "files": [
+            ("key_concepts", "TEXT"),
+            ("risk_notes", "TEXT"),
+            ("llm_summary", "TEXT"),
+            ("llm_confidence", "REAL"),
+            ("purpose", "TEXT"),
+            ("is_core", "BOOLEAN"),
+            ("is_entrypoint", "BOOLEAN"),
+        ],
+    }
+
+    async with engine.begin() as conn:
+        for table_name, cols in optional_columns.items():
+            result = await conn.execute(text(f"PRAGMA table_info({table_name})"))
+            existing = {row[1] for row in result.fetchall()}
+            if not existing:
+                # Table does not exist yet; create_all will handle it.
+                continue
+            for col_name, col_type in cols:
+                if col_name not in existing:
+                    try:
+                        await conn.execute(
+                            text(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}")
+                        )
+                    except Exception:
+                        # Column may have been added concurrently; ignore.
+                        pass
 
 
 @asynccontextmanager
