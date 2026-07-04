@@ -6,6 +6,25 @@ from mcp.server import Server
 from pydantic import BaseModel, Field
 
 
+class SearchFilesInput(BaseModel):
+    project_path: str = Field(default=".", description="Path to the project root")
+    query: str = Field(
+        ...,
+        description="Keyword query; matched against filename, purpose, llm_summary, key_concepts",
+    )
+    only_analyzed: bool = Field(
+        default=False,
+        description="If true, only return files whose LLM analysis is completed",
+    )
+    limit: int = Field(default=20, description="Max number of files to return")
+
+
+class SearchFilesOutput(BaseModel):
+    query: str
+    total: int
+    files: list[dict[str, Any]]
+
+
 class QueryFileInput(BaseModel):
     project_path: str = Field(default=".", description="Path to the project root")
     file_path: str = Field(..., description="Path to the file to query")
@@ -69,6 +88,68 @@ async def register_query_tools(server: Server) -> None:
     """Register all query tools."""
 
     @server.tool()
+    async def project_search_files(input: SearchFilesInput) -> SearchFilesOutput:
+        """
+        Search indexed files by description / keyword.
+        Matches the query against filename, purpose, and llm_summary (the
+        description produced by the external agent during indexing). Files that
+        have been analyzed by the agent (llm_summary present) are ranked first,
+        so callers can quickly bring up the correct, fully-described file data.
+
+        Use this after init→index→agent summarization to find files by what they
+        do rather than by exact path.
+        """
+        from sqlalchemy import or_, select
+
+        from project_memory_mcp.db.connection import get_session
+        from project_memory_mcp.db.models import AnalysisStatus, File
+
+        like = f"%{input.query}%"
+        conditions = [
+            or_(
+                File.filename.ilike(like),
+                File.path.ilike(like),
+                File.purpose.ilike(like),
+                File.llm_summary.ilike(like),
+                File.key_concepts.ilike(like),
+                File.risk_notes.ilike(like),
+            )
+        ]
+        if input.only_analyzed:
+            conditions.append(File.analysis_status == AnalysisStatus.COMPLETED.value)
+
+        async with get_session() as session:
+            stmt = select(File).where(*conditions).limit(input.limit)
+            result = await session.execute(stmt)
+            files = result.scalars().all()
+
+            # Sort: analyzed-with-summary first, then by has summary, then path
+            def _rank(f: File) -> tuple[int, str]:
+                if f.analysis_status == AnalysisStatus.COMPLETED.value and f.llm_summary:
+                    return (0, f.path)
+                if f.llm_summary:
+                    return (1, f.path)
+                return (2, f.path)
+
+            ordered = sorted(files, key=_rank)
+
+            return SearchFilesOutput(
+                query=input.query,
+                total=len(ordered),
+                files=[{
+                    "path": f.path,
+                    "language": f.language,
+                    "purpose": f.purpose,
+                    "llm_summary": f.llm_summary,
+                    "is_core": f.is_core,
+                    "is_entrypoint": f.is_entrypoint,
+                    "is_source": f.is_source,
+                    "analysis_status": f.analysis_status,
+                    "llm_confidence": f.llm_confidence,
+                } for f in ordered],
+            )
+
+    @server.tool()
     async def project_query_file(input: QueryFileInput) -> QueryFileOutput:
         """
         Query a file for its purpose, symbols, equations, and dependencies.
@@ -124,8 +205,12 @@ async def register_query_tools(server: Server) -> None:
                     "language": file_record.language,
                     "purpose": file_record.purpose,
                     "llm_summary": file_record.llm_summary,
+                    "key_concepts": file_record.key_concepts,
+                    "risk_notes": file_record.risk_notes,
+                    "llm_confidence": file_record.llm_confidence,
                     "is_core": file_record.is_core,
                     "is_entrypoint": file_record.is_entrypoint,
+                    "analysis_status": file_record.analysis_status,
                 },
                 symbols=[{
                     "name": s.name,

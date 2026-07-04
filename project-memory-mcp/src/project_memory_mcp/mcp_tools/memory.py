@@ -1,5 +1,6 @@
 """Memory tools for the Project Memory MCP server."""
 
+from pathlib import Path
 from typing import Any
 
 from mcp.server import Server
@@ -50,7 +51,13 @@ class GetNextAnalysisTaskOutput(BaseModel):
     task_type: str
     file_path: str | None = None
     target_name: str | None = None
-    required_output_schema: dict[str, Any]
+    # Full agent-driven prompt bundle: the external agent reads these and generates
+    # a description/summary, then submits it via project_submit_*_analysis.
+    system_prompt: str = ""
+    user_prompt: str = ""
+    output_schema_name: str = ""
+    output_schema: dict[str, Any] = Field(default_factory=dict)
+    has_more: bool = True
 
 
 class SubmitFileAnalysisInput(BaseModel):
@@ -120,6 +127,174 @@ class GenerateManualOutput(BaseModel):
     sections: int
 
 
+class StartAnalysisLoopInput(BaseModel):
+    project_path: str = Field(default=".", description="Path to the project root")
+    llm_provider: str | None = Field(default=None, description="LLM provider: anthropic, openai, google, myself")
+    llm_api_key: str | None = Field(default=None, description="LLM API key")
+    llm_model: str | None = Field(default=None, description="LLM model name")
+    llm_api_base: str | None = Field(default=None, description="LLM API base URL")
+
+
+class StartAnalysisLoopOutput(BaseModel):
+    started: bool
+    message: str
+
+
+class GetAnalysisProgressInput(BaseModel):
+    project_path: str = Field(default=".", description="Path to the project root")
+
+
+class GetAnalysisProgressOutput(BaseModel):
+    is_running: bool
+    current_task_id: str
+    last_error: str | None
+    total_tasks: int
+    pending_tasks: int
+    completed_tasks: int
+    failed_tasks: int
+
+
+
+def _project_root(project_path: str) -> Path:
+    """Resolve the project root, defaulting to cwd."""
+    p = Path(project_path).resolve()
+    return p
+
+
+def _read_source(project_path: str, file_rel_path: str) -> str:
+    """Read a source file from the project, returning empty string on error."""
+    root = _project_root(project_path)
+    full = root / file_rel_path
+    try:
+        return full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        try:
+            return Path(file_rel_path).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+
+
+def _pydantic_json_schema(schema_class) -> dict[str, Any]:
+    """Return the JSON Schema for a Pydantic v2 model class."""
+    try:
+        return schema_class.model_json_schema()
+    except Exception:
+        return {"type": "object"}
+
+
+def _build_analysis_task_output(  # noqa: PLR0913
+    *,
+    analyzer,
+    task_type: str,
+    task_id: str,
+    file_record,
+    project_path: str = ".",
+    symbol=None,
+    equation=None,
+) -> "GetNextAnalysisTaskOutput":
+    """Construct the agent-driven task bundle with a fully formatted prompt.
+
+    The MCP server performs NO LLM call here. It reads the source, formats the
+    prompt chosen from BUILTIN_PROMPTS for the agent, and exposes the JSON
+    Schema the agent must conform to when submitting via project_submit_*_analysis.
+    """
+    from project_memory_mcp.static_analysis.static_locator import StaticLocator
+
+    prompt_name = f"analyze_{task_type}"
+    template = analyzer.get_prompt(prompt_name)
+    if not template:
+        return GetNextAnalysisTaskOutput(
+            task_id=task_id, task_type=task_type, has_more=True,
+        )
+
+    # Build the template context from the DB record + source file.
+    rel_path = file_record.path if file_record else ""
+    language = file_record.language if file_record else "unknown"
+
+    ctx: dict[str, Any] = {
+        "task_id": task_id,
+        "task_type": task_type,
+        "target_path": rel_path,
+        "file_id": file_record.id if file_record else "",
+        "file_path": rel_path,
+        "language": language,
+    }
+
+    # Fetch a fresh static analysis to populate imports/symbols/surrounding_code.
+    locator = StaticLocator()
+    analysis = None
+    if file_record and language != "unknown":
+        try:
+            analysis = locator.analyze_file(str(_project_root(project_path) / rel_path))
+        except Exception:
+            analysis = None
+
+    if task_type == "file":
+        imports = ", ".join(sorted({i.name for i in (analysis.imports if analysis else [])}))
+        symbols_list = ", ".join(
+            sorted({f.name for f in (analysis.functions if analysis else [])}
+                   | {c.name for c in (analysis.classes if analysis else [])})
+        )
+        ctx.update({
+            "source_code": _read_source(project_path, rel_path),
+            "imports": imports,
+            "symbols": symbols_list,
+        })
+    elif task_type == "symbol":
+        sym_dumped = symbol or None
+        sym_source = ""
+        if sym_dumped:
+            sym_source = (
+                Path(str(_project_root(project_path) / rel_path)).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            )
+        ctx.update({
+            "symbol_id": symbol.id if symbol else "",
+            "symbol_name": symbol.name if symbol else "",
+            "symbol_type": symbol.symbol_type if symbol else "",
+            "signature": symbol.signature if symbol and symbol.signature else "",
+            "docstring": symbol.docstring if symbol and symbol.docstring else "",
+            "parent_class": "",
+            "source_code": sym_source,
+            "called_functions": "",
+            "calling_functions": "",
+        })
+    elif task_type == "equation":
+        full_source = _read_source(project_path, rel_path)
+        expr = equation.expression if equation else ""
+        ctx.update({
+            "equation_id": equation.id if equation else "",
+            "equation_name": equation.name if equation and equation.name else "",
+            "containing_function": "",
+            "containing_class": "",
+            "expression": expr,
+            "surrounding_code": full_source,
+            "variables_in_scope": "",
+        })
+
+    try:
+        user_prompt = analyzer.format_prompt(prompt_name, **ctx)
+    except Exception as exc:
+        user_prompt = f"[prompt formatting failed: {exc}]\nAnalyze the source at {rel_path}."
+
+    schema_class = analyzer.get_output_schema(prompt_name)
+    json_schema = _pydantic_json_schema(schema_class)
+
+    return GetNextAnalysisTaskOutput(
+        task_id=task_id,
+        task_type=task_type,
+        file_path=None if file_record is None else file_record.path,
+        target_name=(symbol.name if task_type == "symbol" and symbol else
+                     equation.name if task_type == "equation" and equation else None),
+        system_prompt=template.system_prompt,
+        user_prompt=user_prompt,
+        output_schema_name=template.output_schema,
+        output_schema=json_schema,
+        has_more=True,
+    )
+
+
 async def register_memory_tools(server: Server) -> None:
     """Register all memory-related tools."""
 
@@ -136,12 +311,12 @@ async def register_memory_tools(server: Server) -> None:
             "use_vector_similarity": input.use_vector_similarity,
         }
 
-        result = await index_repository(input.project_path, config)
+        await index_repository(input.project_path, config)
 
         return BootstrapOutput(
             created=True,
             memory_dir=".project-memory",
-            next_step="project.plan_indexing",
+            next_step="project.get_next_analysis_task",
         )
 
     @server.tool()
@@ -159,11 +334,11 @@ async def register_memory_tools(server: Server) -> None:
 
         return PlanIndexingOutput(
             steps=[
-                "scan_files",
-                "extract_static_structure",
-                "analyze_files_with_llm",
-                "analyze_symbols_with_llm",
-                "analyze_equations_with_llm",
+                "scan_files (create File records + extract static structure)",
+                "analyze_files_with_llm: loop get_next_analysis_task(task_type='file')"
+                " then submit_file_analysis until no more tasks",
+                "analyze_symbols_with_llm: repeat for task_type='symbol'",
+                "analyze_equations_with_llm: repeat for task_type='equation'",
                 "build_graph_edges",
                 "generate_manual",
             ],
@@ -203,6 +378,11 @@ async def register_memory_tools(server: Server) -> None:
         """
         Get the next analysis task for the agent to execute.
         Returns a task with the prompt template and required output schema.
+
+        Agent-driven mode: the MCP server does NOT call any LLM. It instead returns
+        the fully formatted system + user prompt and the JSON Schema the agent must
+        produce. The external agent reads the prompt, analyzes the source code, and
+        submits the structured result via project_submit_*_analysis.
         """
         from sqlalchemy import select
 
@@ -220,80 +400,83 @@ async def register_memory_tools(server: Server) -> None:
 
         async with get_session() as session:
             if input.task_type == "file":
-                # Find next file that needs analysis
+                # Find next source file that still needs LLM analysis
                 stmt = select(File).where(
                     (File.is_source == True) &
                     (File.analysis_status == AnalysisStatus.PENDING.value)
-                ).limit(1)
+                ).order_by(File.id).limit(1)
                 result = await session.execute(stmt)
                 file_record = result.scalar_one_or_none()
 
                 if file_record:
-                    task = analyzer.create_analysis_task(
-                        task_id=f"file_{file_record.id}",
+                    return _build_analysis_task_output(
+                        analyzer=analyzer,
                         task_type="file",
-                        target_path=file_record.path,
-                        context={"file_id": file_record.id},
-                    )
-                    return GetNextAnalysisTaskOutput(
-                        task_id=task["task_id"],
-                        task_type=task["task_type"],
-                        file_path=file_record.path,
-                        required_output_schema={"type": "object"},  # Would be actual JSON schema
+                        task_id=f"file_{file_record.id}",
+                        file_record=file_record,
+                        project_path=input.project_path,
                     )
 
             elif input.task_type == "symbol":
-                stmt = select(Symbol).where(
-                    Symbol.symbol_type.in_(["function", "method", "class"])
-                ).join(LLMAnalysisRecord, isouter=True).where(
-                    LLMAnalysisRecord.id.is_(None)
-                ).limit(1)
+                stmt = (
+                    select(Symbol)
+                    .where(Symbol.symbol_type.in_(["function", "method", "class"]))
+                    .outerjoin(
+                        LLMAnalysisRecord,
+                        (LLMAnalysisRecord.target_type == "symbol") &
+                        (LLMAnalysisRecord.target_id == Symbol.id),
+                    )
+                    .where(LLMAnalysisRecord.id.is_(None))
+                    .order_by(Symbol.id)
+                    .limit(1)
+                )
                 result = await session.execute(stmt)
                 symbol = result.scalar_one_or_none()
 
                 if symbol:
-                    task = analyzer.create_analysis_task(
-                        task_id=f"symbol_{symbol.id}",
+                    # Load parent file for language + path
+                    file_stmt = select(File).where(File.id == symbol.file_id)
+                    file_record = (await session.execute(file_stmt)).scalar_one_or_none()
+                    return _build_analysis_task_output(
+                        analyzer=analyzer,
                         task_type="symbol",
-                        target_path=symbol.qualified_name,
-                        target_name=symbol.name,
-                        context={"symbol_id": symbol.id, "file_id": symbol.file_id},
-                    )
-                    return GetNextAnalysisTaskOutput(
-                        task_id=task["task_id"],
-                        task_type=task["task_type"],
-                        file_path=None,
-                        target_name=symbol.name,
-                        required_output_schema={"type": "object"},
+                        task_id=f"symbol_{symbol.id}",
+                        file_record=file_record,
+                        symbol=symbol,
+                        project_path=input.project_path,
                     )
 
             elif input.task_type == "equation":
-                stmt = select(Equation).join(LLMAnalysisRecord, isouter=True).where(
-                    LLMAnalysisRecord.id.is_(None)
-                ).limit(1)
+                stmt = (
+                    select(Equation)
+                    .outerjoin(
+                        LLMAnalysisRecord,
+                        (LLMAnalysisRecord.target_type == "equation") &
+                        (LLMAnalysisRecord.target_id == Equation.id),
+                    )
+                    .where(LLMAnalysisRecord.id.is_(None))
+                    .order_by(Equation.id)
+                    .limit(1)
+                )
                 result = await session.execute(stmt)
                 equation = result.scalar_one_or_none()
 
                 if equation:
-                    task = analyzer.create_analysis_task(
-                        task_id=f"equation_{equation.id}",
+                    file_stmt = select(File).where(File.id == equation.file_id)
+                    file_record = (await session.execute(file_stmt)).scalar_one_or_none()
+                    return _build_analysis_task_output(
+                        analyzer=analyzer,
                         task_type="equation",
-                        target_path=equation.name or f"eq_{equation.id}",
-                        target_name=equation.name,
-                        context={"equation_id": equation.id, "file_id": equation.file_id},
-                    )
-                    return GetNextAnalysisTaskOutput(
-                        task_id=task["task_id"],
-                        task_type=task["task_type"],
-                        file_path=None,
-                        target_name=equation.name,
-                        required_output_schema={"type": "object"},
+                        task_id=f"equation_{equation.id}",
+                        file_record=file_record,
+                        equation=equation,
+                        project_path=input.project_path,
                     )
 
         return GetNextAnalysisTaskOutput(
             task_id="",
             task_type="none",
-            required_output_schema={},
+            has_more=False,
         )
 
     @server.tool()
@@ -335,6 +518,13 @@ async def register_memory_tools(server: Server) -> None:
                 file_record.llm_summary = validated.result.get("summary", "")
                 file_record.llm_confidence = validated.result.get("confidence", 0.0)
                 file_record.is_core = validated.result.get("is_core", False)
+                import json as _json
+                file_record.key_concepts = _json.dumps(
+                    validated.result.get("key_concepts", []), ensure_ascii=False
+                )
+                file_record.risk_notes = _json.dumps(
+                    validated.result.get("risk_notes", []), ensure_ascii=False
+                )
                 file_record.analysis_status = AnalysisStatus.COMPLETED.value
 
                 # Update LLM analysis record
@@ -527,3 +717,71 @@ async def register_memory_tools(server: Server) -> None:
             manual_path=".project-memory/PROJECT_AGENT_MANUAL.md",
             sections=0,
         )
+
+    @server.tool()
+    async def project_start_analysis_loop(input: StartAnalysisLoopInput) -> StartAnalysisLoopOutput:
+        """
+        Start the LLM analysis loop in the background to automatically build Descriptions/Summaries.
+        """
+        from project_memory_mcp.utils.config import get_settings, reset_settings
+        from project_memory_mcp.llm_analysis.analyzer import _analyzer
+        import project_memory_mcp.llm_analysis.analyzer as analyzer_mod
+        from project_memory_mcp.workflows.background_analysis import runner
+
+        # Reset global settings/analyzer
+        reset_settings()
+        settings = get_settings()
+
+        # Apply custom configuration or defaults
+        settings.llm_provider = input.llm_provider if input.llm_provider is not None else "myself"
+        settings.llm_api_base = input.llm_api_base if input.llm_api_base is not None else "http://localhost:4000/v1"
+        settings.llm_model = input.llm_model if input.llm_model is not None else "patcher-main"
+        settings.llm_api_key = input.llm_api_key if input.llm_api_key is not None else "not-needed"
+        settings.llm_mode = "server_driven"
+
+        # Re-initialize analyzer
+        analyzer_mod._analyzer = None
+
+        # Start background loop
+        msg = runner.start(input.project_path)
+        return StartAnalysisLoopOutput(started=runner.is_running, message=msg)
+
+    @server.tool()
+    async def project_get_analysis_progress(input: GetAnalysisProgressInput) -> GetAnalysisProgressOutput:
+        """
+        Check the progress and status of the background analysis loop.
+        """
+        from sqlalchemy import select, func
+        from project_memory_mcp.db.connection import get_session
+        from project_memory_mcp.db.models import LLMAnalysisRecord, AnalysisStatus
+        from project_memory_mcp.workflows.background_analysis import runner
+
+        total_tasks = 0
+        pending_tasks = 0
+        completed_tasks = 0
+        failed_tasks = 0
+
+        async with get_session() as session:
+            # Query counts
+            stmt_total = select(func.count()).select_from(LLMAnalysisRecord)
+            total_tasks = (await session.execute(stmt_total)).scalar() or 0
+
+            stmt_pending = select(func.count()).select_from(LLMAnalysisRecord).where(LLMAnalysisRecord.status == AnalysisStatus.PENDING.value)
+            pending_tasks = (await session.execute(stmt_pending)).scalar() or 0
+
+            stmt_completed = select(func.count()).select_from(LLMAnalysisRecord).where(LLMAnalysisRecord.status == AnalysisStatus.COMPLETED.value)
+            completed_tasks = (await session.execute(stmt_completed)).scalar() or 0
+
+            stmt_failed = select(func.count()).select_from(LLMAnalysisRecord).where(LLMAnalysisRecord.status == AnalysisStatus.FAILED.value)
+            failed_tasks = (await session.execute(stmt_failed)).scalar() or 0
+
+        return GetAnalysisProgressOutput(
+            is_running=runner.is_running,
+            current_task_id=runner.current_task_id,
+            last_error=runner.last_error,
+            total_tasks=total_tasks,
+            pending_tasks=pending_tasks,
+            completed_tasks=completed_tasks,
+            failed_tasks=failed_tasks,
+        )
+
