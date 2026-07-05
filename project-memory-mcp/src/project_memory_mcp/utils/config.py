@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     transport: str = Field(default="stdio", description="Transport mode: stdio or http")
 
     # LLM Configuration
-    llm_mode: str = Field(default="agent_driven", description="LLM mode: agent_driven or server_driven")
+    llm_mode: str = Field(default="server_driven", description="LLM mode: agent_driven or server_driven")
     llm_provider: str = Field(default="myself", description="LLM provider: anthropic, openai, google, myself")
     llm_api_key: str = Field(default="not-needed", description="LLM API key")
     llm_model: str = Field(default="patcher-main", description="LLM model name")

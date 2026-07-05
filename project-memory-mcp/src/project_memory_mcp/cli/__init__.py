@@ -41,7 +41,7 @@ def _load_config_if_provided(config: Optional[str]) -> dict | None:
 @app.command()
 def init(
     project_path: str = typer.Argument(".", help="Project root directory"),
-    mode: str = typer.Option("agent_driven", help="LLM mode: agent_driven or server_driven"),
+    mode: str = typer.Option("server_driven", help="LLM mode: agent_driven or server_driven"),
     no_vector: bool = typer.Option(True, help="Disable vector similarity search"),
     config: Optional[str] = typer.Option(None, "--config", help="Path to configuration file (YAML or JSON)"),
 ):

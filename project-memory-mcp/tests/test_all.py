@@ -55,7 +55,8 @@ class TestProjectMemoryFullSuite(unittest.IsolatedAsyncioTestCase):
         reset_settings()
         settings = get_settings()
         self.assertIsNotNone(settings.exclude_patterns)
-        self.assertEqual(settings.llm_mode, "agent_driven")
+        self.assertEqual(settings.llm_mode, "server_driven")
+        self.assertEqual(settings.llm_api_base, "http://localhost:4000/v1")
 
     def test_static_locator_parsing(self):
         """Test tree-sitter static locator with a simple python code snippet."""

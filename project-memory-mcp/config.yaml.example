@@ -10,10 +10,14 @@ database:
   echo: false
 
 llm:
-  mode: "agent_driven"  # or "server_driven"
-  provider: "anthropic"  # anthropic, openai, google
-  api_key: "${ANTHROPIC_API_KEY}"
-  model: "claude-3-5-sonnet-20241022"
+  # Default description analysis uses a local OpenAI-compatible LLM.
+  # If http://localhost:4000/v1 is unavailable, agents should ask before
+  # spending their own tokens on agent-driven analysis.
+  mode: "server_driven"  # or "agent_driven"
+  provider: "myself"  # anthropic, openai, google, myself
+  api_key: "not-needed"
+  model: "patcher-main"
+  api_base: "http://localhost:4000/v1"
   temperature: 0.1
 
 analysis:

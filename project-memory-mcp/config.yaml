@@ -10,7 +10,7 @@ database:
   echo: false
 
 llm:
-  mode: "agent_driven"  # or "server_driven"
+  mode: "server_driven"  # or "agent_driven"
   provider: "myself"  # anthropic, openai, google, myself
   api_key: "not-needed"
   model: "patcher-main"

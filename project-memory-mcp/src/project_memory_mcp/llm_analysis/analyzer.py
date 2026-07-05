@@ -390,6 +390,6 @@ _analyzer: LLMAnalyzer | None = None
 def get_analyzer(mode: str = "agent_driven") -> LLMAnalyzer:
     """Get the global LLM analyzer instance."""
     global _analyzer
-    if _analyzer is None:
+    if _analyzer is None or _analyzer.mode != mode:
         _analyzer = LLMAnalyzer(mode=mode)
     return _analyzer
