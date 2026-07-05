@@ -5,8 +5,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import delete, select
+
 from project_memory_mcp.db.connection import get_session
-from project_memory_mcp.db.models import AnalysisStatus, File, GraphEdge, OperationsHistory
+from project_memory_mcp.db.models import (
+    AnalysisStatus,
+    File,
+    GraphEdge,
+    LLMAnalysisRecord,
+    OperationsHistory,
+    Symbol,
+)
 from project_memory_mcp.llm_analysis.analyzer import get_analyzer
 from project_memory_mcp.static_analysis.file_scanner import FileScanner
 from project_memory_mcp.static_analysis.static_locator import StaticLocator
@@ -35,6 +44,35 @@ class RescanChangedFilesWorkflow:
         )
         self.locator = StaticLocator()
         self.analyzer = get_analyzer(mode="agent_driven")
+
+    def _build_analysis_record(self, task: dict[str, Any]) -> LLMAnalysisRecord:
+        """Build a PENDING LLMAnalysisRecord row from a task dict (matches IndexRepositoryWorkflow)."""
+        model_name = (
+            self.config.get("llm_model")
+            or getattr(getattr(self.analyzer, "settings", None), "llm_model", None)
+            or "unknown"
+        )
+        return LLMAnalysisRecord(
+            target_type=task["task_type"],
+            target_id=int(task["task_id"].split("_")[-1]),
+            prompt_name=task["prompt_name"],
+            prompt_version=task["prompt_version"],
+            model_name=model_name,
+            input_context_hash=task["context_hash"],
+            output_json="{}",
+            confidence=0.0,
+            status=AnalysisStatus.PENDING.value,
+        )
+
+    def _create_file_analysis_record(self, file_record: File) -> LLMAnalysisRecord:
+        """Build a PENDING file-level LLMAnalysisRecord for a file (caller session.add's it)."""
+        task = self.analyzer.create_analysis_task(
+            task_id=f"file_{file_record.id}",
+            task_type="file",
+            target_path=file_record.path,
+            context={"file_id": file_record.id},
+        )
+        return self._build_analysis_record(task)
 
     async def execute(self) -> dict[str, Any]:
         """Execute the rescan workflow."""
@@ -90,7 +128,6 @@ class RescanChangedFilesWorkflow:
 
     async def _get_previous_file_hashes(self) -> dict[str, str]:
         """Get file hashes from database."""
-        from sqlalchemy import select
         async with get_session() as session:
             stmt = select(File.path, File.hash)
             result = await session.execute(stmt)
@@ -117,13 +154,15 @@ class RescanChangedFilesWorkflow:
             session.add(file_record)
             await session.flush()
 
+            # Create a PENDING LLMAnalysisRecord for this new file
+            session.add(self._create_file_analysis_record(file_record))
+
             # Extract static structure
             if file_info.is_source and file_info.language:
                 await self._extract_and_store_structure(file_record, file_info, session)
 
     async def _process_changed_file(self, file_info, results: dict[str, Any]) -> None:
         """Process a changed file - update existing record and re-extract."""
-        from sqlalchemy import select
         async with get_session() as session:
             stmt = select(File).where(File.path == file_info.relative_path)
             result = await session.execute(stmt)
@@ -139,8 +178,14 @@ class RescanChangedFilesWorkflow:
             file_record.updated_at = datetime.utcnow()
             file_record.analysis_status = AnalysisStatus.PENDING.value
 
-            # Remove old symbols, equations, edges for this file
+            # Remove old symbols, equations, edges for this file (also deletes stale
+            # LLMAnalysisRecord rows for the file + its symbols, so the background
+            # loop can no longer pick up the old completed/failed records).
             await self._clear_file_data(file_record.id, session)
+
+            # Re-create a PENDING LLMAnalysisRecord so server_driven/background loop
+            # and get_analysis_progress see this file as pending (mirrors initial scan).
+            session.add(self._create_file_analysis_record(file_record))
 
             # Re-extract static structure
             if file_info.is_source and file_info.language:
@@ -148,7 +193,6 @@ class RescanChangedFilesWorkflow:
 
     async def _process_deleted_file(self, rel_path: str, results: dict[str, Any]) -> None:
         """Process a deleted file - remove from database."""
-        from sqlalchemy import select
         async with get_session() as session:
             stmt = select(File).where(File.path == rel_path)
             result = await session.execute(stmt)
@@ -164,10 +208,6 @@ class RescanChangedFilesWorkflow:
     async def _clear_file_data(self, file_id: int, session) -> None:
         """Clear all data associated with a file."""
         # Delete symbols (cascades to equations, variables via foreign keys)
-        from sqlalchemy import delete
-
-        from project_memory_mcp.db.models import Symbol
-
         # Get symbol IDs for this file
         stmt = select(Symbol.id).where(Symbol.file_id == file_id)
         result = await session.execute(stmt)
@@ -182,7 +222,6 @@ class RescanChangedFilesWorkflow:
             await session.execute(stmt)
 
             # Delete LLM analysis records for these symbols
-            from project_memory_mcp.db.models import LLMAnalysisRecord
             stmt = delete(LLMAnalysisRecord).where(
                 (LLMAnalysisRecord.target_type == "symbol") & (LLMAnalysisRecord.target_id.in_(symbol_ids))
             )
@@ -192,6 +231,12 @@ class RescanChangedFilesWorkflow:
         stmt = delete(GraphEdge).where(
             (GraphEdge.source_type == "file") & (GraphEdge.source_id == file_id) |
             (GraphEdge.target_type == "file") & (GraphEdge.target_id == file_id)
+        )
+        await session.execute(stmt)
+
+        # Delete LLM analysis records for this file (target_type="file")
+        stmt = delete(LLMAnalysisRecord).where(
+            (LLMAnalysisRecord.target_type == "file") & (LLMAnalysisRecord.target_id == file_id)
         )
         await session.execute(stmt)
 

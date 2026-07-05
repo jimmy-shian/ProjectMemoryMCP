@@ -18,7 +18,6 @@ from project_memory_mcp.db.models import (
     Symbol,
 )
 from project_memory_mcp.llm_analysis.analyzer import get_analyzer
-from project_memory_mcp.utils.config import get_settings, reset_settings
 
 logger = logging.getLogger(__name__)
 
