@@ -70,6 +70,8 @@ class SubmitFileAnalysisOutput(BaseModel):
     accepted: bool
     db_updated: bool
     next_step: str
+    error: str | None = None
+    reason: str | None = None
 
 
 class SubmitSymbolAnalysisInput(BaseModel):
@@ -82,6 +84,8 @@ class SubmitSymbolAnalysisOutput(BaseModel):
     accepted: bool
     db_updated: bool
     next_step: str
+    error: str | None = None
+    reason: str | None = None
 
 
 class SubmitEquationAnalysisInput(BaseModel):
@@ -94,6 +98,8 @@ class SubmitEquationAnalysisOutput(BaseModel):
     accepted: bool
     db_updated: bool
     next_step: str
+    error: str | None = None
+    reason: str | None = None
 
 
 class BuildGraphEdgesInput(BaseModel):
@@ -545,6 +551,8 @@ async def register_memory_tools(server: Server) -> None:
                 accepted=False,
                 db_updated=False,
                 next_step="project_get_next_analysis_task",
+                error=validated.error,
+                reason=validated.error or "analysis validation failed",
             )
 
         # Store in database
@@ -580,11 +588,19 @@ async def register_memory_tools(server: Server) -> None:
                     analysis_record.confidence = validated.confidence
                     analysis_record.status = AnalysisStatus.COMPLETED.value
 
-        return SubmitFileAnalysisOutput(
-            accepted=True,
-            db_updated=True,
-            next_step="project_get_next_analysis_task",
-        )
+                return SubmitFileAnalysisOutput(
+                    accepted=True,
+                    db_updated=True,
+                    next_step="project_get_next_analysis_task",
+                )
+
+            return SubmitFileAnalysisOutput(
+                accepted=False,
+                db_updated=False,
+                next_step="project_get_next_analysis_task",
+                error=f"file record not found for task_id {input.task_id}",
+                reason=f"file record not found for task_id {input.task_id}",
+            )
 
     @server.tool()
     async def project_submit_symbol_analysis(input: SubmitSymbolAnalysisInput) -> SubmitSymbolAnalysisOutput:
@@ -610,6 +626,8 @@ async def register_memory_tools(server: Server) -> None:
                 accepted=False,
                 db_updated=False,
                 next_step="project_get_next_analysis_task",
+                error=validated.error,
+                reason=validated.error or "analysis validation failed",
             )
 
         async with get_session() as session:
@@ -637,11 +655,19 @@ async def register_memory_tools(server: Server) -> None:
                     analysis_record.confidence = validated.confidence
                     analysis_record.status = AnalysisStatus.COMPLETED.value
 
-        return SubmitSymbolAnalysisOutput(
-            accepted=True,
-            db_updated=True,
-            next_step="project_get_next_analysis_task",
-        )
+                return SubmitSymbolAnalysisOutput(
+                    accepted=True,
+                    db_updated=True,
+                    next_step="project_get_next_analysis_task",
+                )
+
+            return SubmitSymbolAnalysisOutput(
+                accepted=False,
+                db_updated=False,
+                next_step="project_get_next_analysis_task",
+                error=f"symbol record not found for task_id {input.task_id}",
+                reason=f"symbol record not found for task_id {input.task_id}",
+            )
 
     @server.tool()
     async def project_submit_equation_analysis(input: SubmitEquationAnalysisInput) -> SubmitEquationAnalysisOutput:
@@ -669,6 +695,8 @@ async def register_memory_tools(server: Server) -> None:
                 accepted=False,
                 db_updated=False,
                 next_step="project_get_next_analysis_task",
+                error=validated.error,
+                reason=validated.error or "analysis validation failed",
             )
 
         async with get_session() as session:
@@ -704,11 +732,19 @@ async def register_memory_tools(server: Server) -> None:
                     analysis_record.confidence = validated.confidence
                     analysis_record.status = AnalysisStatus.COMPLETED.value
 
-        return SubmitEquationAnalysisOutput(
-            accepted=True,
-            db_updated=True,
-            next_step="project_get_next_analysis_task",
-        )
+                return SubmitEquationAnalysisOutput(
+                    accepted=True,
+                    db_updated=True,
+                    next_step="project_get_next_analysis_task",
+                )
+
+            return SubmitEquationAnalysisOutput(
+                accepted=False,
+                db_updated=False,
+                next_step="project_get_next_analysis_task",
+                error=f"equation record not found for task_id {input.task_id}",
+                reason=f"equation record not found for task_id {input.task_id}",
+            )
 
     @server.tool()
     async def project_build_graph_edges(input: BuildGraphEdgesInput) -> BuildGraphEdgesOutput:

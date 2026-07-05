@@ -171,6 +171,7 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
     Get a database session.
 
     Usage:
+        from sqlalchemy import select
         async with get_session() as session:
             result = await session.execute(select(File))
     """
