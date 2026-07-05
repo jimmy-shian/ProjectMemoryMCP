@@ -123,16 +123,6 @@ class RescanChangedFilesOutput(BaseModel):
     files_deleted: int
 
 
-class GenerateManualInput(BaseModel):
-    project_path: str = Field(default=".", description="Path to the project root")
-
-
-class GenerateManualOutput(BaseModel):
-    generated: bool
-    manual_path: str
-    sections: int
-
-
 class StartAnalysisLoopInput(BaseModel):
     project_path: str = Field(default=".", description="Path to the project root")
     llm_provider: str | None = Field(default=None, description="LLM provider: anthropic, openai, google, myself")
@@ -776,22 +766,6 @@ async def register_memory_tools(server: Server) -> None:
             files_changed=result.get("files_changed", 0),
             files_added=result.get("files_added", 0),
             files_deleted=result.get("files_deleted", 0),
-        )
-
-    @server.tool()
-    async def project_generate_manual(input: GenerateManualInput) -> GenerateManualOutput:
-        """
-        Generate or update PROJECT_AGENT_MANUAL.md for the project.
-        """
-        from project_memory_mcp.workflows.generate_manual import GenerateManualWorkflow
-
-        workflow = GenerateManualWorkflow(input.project_path)
-        await workflow.execute()
-
-        return GenerateManualOutput(
-            generated=True,
-            manual_path=".project-memory/PROJECT_AGENT_MANUAL.md",
-            sections=0,
         )
 
     @server.tool()
