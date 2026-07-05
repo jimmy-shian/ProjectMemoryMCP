@@ -1,0 +1,27 @@
+{
+  "name": "project-memory-mcp",
+  "version": "0.1.0",
+  "description": "Project-local knowledge graph MCP server for code understanding.",
+  "bin": {
+    "project-memory-mcp": "bin/project-memory-mcp.js",
+    "project-memory": "bin/project-memory-mcp.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "pyproject.toml",
+    "README.md",
+    "config.yaml.example",
+    "config.json.example"
+  ],
+  "keywords": [
+    "mcp",
+    "llm",
+    "codebase",
+    "knowledge-graph"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}
