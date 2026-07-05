@@ -59,6 +59,11 @@ class FileScanner:
         ".tox",
         ".idea",
         ".vscode",
+        # Archive/staging directories — should not be analyzed as active source.
+        "_archive",
+        ".archive",
+        # MCP's own memory directory (contains the database/manual artifacts).
+        ".project-memory",
         "*.pyc",
         "*.pyo",
         "*.pyd",

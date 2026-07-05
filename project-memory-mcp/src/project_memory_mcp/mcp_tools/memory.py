@@ -134,6 +134,7 @@ class StartAnalysisLoopInput(BaseModel):
 class StartAnalysisLoopOutput(BaseModel):
     started: bool
     message: str
+    fallback: str | None = None
 
 
 class GetAnalysisProgressInput(BaseModel):
@@ -176,6 +177,22 @@ def _pydantic_json_schema(schema_class) -> dict[str, Any]:
         return schema_class.model_json_schema()
     except Exception:
         return {"type": "object"}
+
+
+async def _check_local_llm(api_base: str) -> tuple[bool, str]:
+    """Best-effort health check for an OpenAI-compatible local endpoint."""
+    import httpx
+
+    base = api_base.rstrip("/")
+    url = f"{base}/models"
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.get(url)
+        if response.status_code < 500 and response.status_code != 404:
+            return True, f"Local LLM endpoint is reachable: {url}"
+        return False, f"Local LLM endpoint returned HTTP {response.status_code}: {url}"
+    except Exception as exc:
+        return False, f"Local LLM endpoint is not reachable: {url} ({exc})"
 
 
 def _build_analysis_task_output(  # noqa: PLR0913
@@ -772,10 +789,17 @@ async def register_memory_tools(server: Server) -> None:
     async def project_start_analysis_loop(input: StartAnalysisLoopInput) -> StartAnalysisLoopOutput:
         """
         Start the LLM analysis loop in the background to automatically build Descriptions/Summaries.
+
+        Default policy:
+        1. Try the local OpenAI-compatible endpoint at http://localhost:4000/v1.
+        2. If it is unavailable, do not spend the calling agent's tokens silently.
+           Return instructions telling the agent to ask the user for permission to
+           run agent-driven analysis.
+        3. If the user does not permit agent-driven analysis, keep the static
+           knowledge graph only; file/symbol/import/call records remain queryable.
         """
-        from project_memory_mcp.utils.config import get_settings, reset_settings
-        from project_memory_mcp.llm_analysis.analyzer import _analyzer
         import project_memory_mcp.llm_analysis.analyzer as analyzer_mod
+        from project_memory_mcp.utils.config import get_settings, reset_settings
         from project_memory_mcp.workflows.background_analysis import runner
 
         # Reset global settings/analyzer
@@ -791,6 +815,21 @@ async def register_memory_tools(server: Server) -> None:
 
         # Re-initialize analyzer
         analyzer_mod._analyzer = None
+
+        if settings.llm_provider.lower() == "myself":
+            reachable, detail = await _check_local_llm(settings.llm_api_base)
+            if not reachable:
+                return StartAnalysisLoopOutput(
+                    started=False,
+                    message=detail,
+                    fallback=(
+                        "Ask the user whether this agent may run agent-driven analysis "
+                        "with project.get_next_analysis_task and project.submit_*_analysis. "
+                        "If the user does not allow that, continue with the static map only: "
+                        "scan files, build graph edges, and query file/symbol/import/call records "
+                        "without LLM descriptions."
+                    ),
+                )
 
         # Start background loop
         msg = runner.start(input.project_path)
@@ -834,4 +873,3 @@ async def register_memory_tools(server: Server) -> None:
             completed_tasks=completed_tasks,
             failed_tasks=failed_tasks,
         )
-

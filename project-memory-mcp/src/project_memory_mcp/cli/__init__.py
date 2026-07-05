@@ -72,8 +72,9 @@ def init(
         console.print(f"[green]✓[/green] Equations found: {result.get('equations_found', 0)}")
         console.print(f"[green]✓[/green] Analysis tasks created: {result.get('analysis_tasks_created', 0)}")
         console.print("\n[bold]Next steps:[/bold]")
-        console.print("1. Run 'project-memory-mcp index' to start analysis")
-        console.print("2. Agent will call 'project.get_next_analysis_task' for tasks")
+        console.print("1. Start the MCP server with 'project-memory-mcp'")
+        console.print("2. Call project.start_analysis_loop to use local http://localhost:4000/v1")
+        console.print("3. If local LLM is unavailable, ask before using agent-driven analysis")
 
     asyncio.run(run())
 
