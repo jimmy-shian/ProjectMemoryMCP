@@ -56,12 +56,12 @@ def init(
         if config_dict:
             # Merge config file settings with CLI options (CLI takes precedence)
             config_dict.update({
-                "mode": mode,
+                "llm_mode": mode,
                 "use_vector_similarity": not no_vector,
             })
         else:
             config_dict = {
-                "mode": mode,
+                "llm_mode": mode,
                 "use_vector_similarity": not no_vector,
             }
         

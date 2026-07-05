@@ -58,6 +58,14 @@ class TestProjectMemoryFullSuite(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings.llm_mode, "server_driven")
         self.assertEqual(settings.llm_api_base, "http://localhost:4000/v1")
 
+    def test_nested_config_loading(self):
+        """Test documented nested configuration is flattened for runtime settings."""
+        config = load_config(Path(__file__).resolve().parent.parent / "config.yaml")
+        self.assertEqual(config["llm_mode"], "server_driven")
+        self.assertEqual(config["llm_provider"], "myself")
+        self.assertEqual(config["llm_api_base"], "http://localhost:4000/v1")
+        self.assertEqual(config["db_path"], ".project-memory/project_knowledge.db")
+
     def test_static_locator_parsing(self):
         """Test tree-sitter static locator with a simple python code snippet."""
         locator = StaticLocator()

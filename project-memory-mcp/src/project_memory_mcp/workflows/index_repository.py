@@ -120,7 +120,7 @@ class IndexRepositoryWorkflow:
     async def from_config_file(cls, config_path: str | Path) -> "IndexRepositoryWorkflow":
         """Create workflow instance from configuration file."""
         config = load_config(config_path)
-        project_path = config.get("project", {}).get("root", ".")
+        project_path = config.get("project_root", ".")
         return cls(project_path, config=config, config_path=config_path)
 
     @classmethod

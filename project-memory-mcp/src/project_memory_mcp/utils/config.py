@@ -133,6 +133,7 @@ class Settings(BaseSettings):
         
         # Handle environment variable substitution
         config_data = cls._substitute_env_vars(config_data)
+        config_data = cls.flatten_config(config_data)
         
         return cls(**config_data)
     
@@ -148,6 +149,61 @@ class Settings(BaseSettings):
             return os.environ.get(env_var, data)
         else:
             return data
+
+    @classmethod
+    def flatten_config(cls, data: dict[str, Any]) -> dict[str, Any]:
+        """Flatten documented YAML/JSON sections into Settings field names.
+
+        The public examples use grouped sections such as ``llm.mode`` and
+        ``database.path``. Internally the settings object uses flat env-friendly
+        field names, so this adapter keeps both formats working.
+        """
+        flattened: dict[str, Any] = {
+            k: v for k, v in data.items() if not isinstance(v, dict)
+        }
+
+        project = data.get("project", {})
+        if isinstance(project, dict):
+            if "root" in project:
+                flattened["project_root"] = project["root"]
+            if "memory_dir" in project:
+                flattened["memory_dir"] = project["memory_dir"]
+
+        database = data.get("database", {})
+        if isinstance(database, dict):
+            if "path" in database:
+                flattened["db_path"] = database["path"]
+            if "echo" in database:
+                flattened["db_echo"] = database["echo"]
+
+        llm = data.get("llm", {})
+        if isinstance(llm, dict):
+            for key in ("mode", "provider", "api_key", "model", "api_base", "temperature"):
+                if key in llm:
+                    flattened[f"llm_{key}"] = llm[key]
+
+        analysis = data.get("analysis", {})
+        if isinstance(analysis, dict):
+            flattened.update(analysis)
+
+        safety = data.get("safety", {})
+        if isinstance(safety, dict):
+            flattened.update(safety)
+
+        workflow = data.get("workflow", {})
+        if isinstance(workflow, dict):
+            if "auto_index" in workflow:
+                flattened["workflow_auto_index"] = workflow["auto_index"]
+            if "auto_build_graph" in workflow:
+                flattened["workflow_auto_build_graph"] = workflow["auto_build_graph"]
+            if "auto_generate_manual" in workflow:
+                flattened["workflow_auto_generate_manual"] = workflow["auto_generate_manual"]
+
+        for key in ("exclude_patterns", "languages", "transport"):
+            if key in data:
+                flattened[key] = data[key]
+
+        return flattened
     
     def to_dict(self) -> dict[str, Any]:
         """Convert settings to dictionary for workflow config."""
@@ -195,5 +251,6 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
     
     # Handle environment variable substitution
     config_data = Settings._substitute_env_vars(config_data)
+    config_data = Settings.flatten_config(config_data)
     
     return config_data
