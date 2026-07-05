@@ -384,7 +384,7 @@ async def register_memory_tools(server: Server) -> None:
         produce. The external agent reads the prompt, analyzes the source code, and
         submits the structured result via project_submit_*_analysis.
         """
-        from sqlalchemy import select
+        from sqlalchemy import or_, select
 
         from project_memory_mcp.db.connection import get_session
         from project_memory_mcp.db.models import (
@@ -400,11 +400,31 @@ async def register_memory_tools(server: Server) -> None:
 
         async with get_session() as session:
             if input.task_type == "file":
-                # Find next source file that still needs LLM analysis
-                stmt = select(File).where(
-                    (File.is_source == True) &
-                    (File.analysis_status == AnalysisStatus.PENDING.value)
-                ).order_by(File.id).limit(1)
+                # Find next source file that still needs LLM analysis.
+                # The source of truth for "needs analysis" is llm_analysis_records
+                # (status == PENDING), mirroring the symbol/equation branches and the
+                # background analysis loop. Relying solely on files.analysis_status led
+                # to desync: a file could be COMPLETED in llm_analysis_records while
+                # files.analysis_status was still PENDING (or vice-versa), causing the
+                # agent to receive an already-completed file repeatedly. Also exclude
+                # archive paths so stale `_archive` files don't get surfaced as tasks.
+                stmt = (
+                    select(File)
+                    .join(LLMAnalysisRecord, (
+                        (LLMAnalysisRecord.target_type == "file")
+                        & (LLMAnalysisRecord.target_id == File.id)
+                    ))
+                    .where(
+                        File.is_source.is_(True)
+                        & (LLMAnalysisRecord.status == AnalysisStatus.PENDING.value)
+                        & ~or_(
+                            File.path.like("%/_archive/%"),
+                            File.path.like("%\\_archive\\%"),
+                        )
+                    )
+                    .order_by(File.id)
+                    .limit(1)
+                )
                 result = await session.execute(stmt)
                 file_record = result.scalar_one_or_none()
 
@@ -420,13 +440,23 @@ async def register_memory_tools(server: Server) -> None:
             elif input.task_type == "symbol":
                 stmt = (
                     select(Symbol)
+                    .join(File, File.id == Symbol.file_id)
                     .where(Symbol.symbol_type.in_(["function", "method", "class"]))
+                    .where(
+                        ~or_(
+                            File.path.like("%/_archive/%"),
+                            File.path.like("%\\_archive\\%"),
+                        )
+                    )
                     .outerjoin(
                         LLMAnalysisRecord,
                         (LLMAnalysisRecord.target_type == "symbol") &
                         (LLMAnalysisRecord.target_id == Symbol.id),
                     )
-                    .where(LLMAnalysisRecord.id.is_(None))
+                    .where(
+                        (LLMAnalysisRecord.id.is_(None))
+                        | (LLMAnalysisRecord.status == AnalysisStatus.PENDING.value)
+                    )
                     .order_by(Symbol.id)
                     .limit(1)
                 )
@@ -449,12 +479,22 @@ async def register_memory_tools(server: Server) -> None:
             elif input.task_type == "equation":
                 stmt = (
                     select(Equation)
+                    .join(File, File.id == Equation.file_id)
+                    .where(
+                        ~or_(
+                            File.path.like("%/_archive/%"),
+                            File.path.like("%\\_archive\\%"),
+                        )
+                    )
                     .outerjoin(
                         LLMAnalysisRecord,
                         (LLMAnalysisRecord.target_type == "equation") &
                         (LLMAnalysisRecord.target_id == Equation.id),
                     )
-                    .where(LLMAnalysisRecord.id.is_(None))
+                    .where(
+                        (LLMAnalysisRecord.id.is_(None))
+                        | (LLMAnalysisRecord.status == AnalysisStatus.PENDING.value)
+                    )
                     .order_by(Equation.id)
                     .limit(1)
                 )

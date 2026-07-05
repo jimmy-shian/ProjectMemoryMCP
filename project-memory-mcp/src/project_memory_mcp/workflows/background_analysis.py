@@ -79,6 +79,17 @@ class BackgroundAnalysisRunner:
                         self.current_task_id = f"{task_type}_{rec.target_id}"
                         target_id = rec.target_id
 
+                        # Skip tasks whose target file lives under an archive path.
+                        # Such records are typically stale leftovers from old scans
+                        # and re-analyzing them wastes LLM calls on dead code.
+                        if await self._target_is_archived(session, task_type, target_id):
+                            rec.status = AnalysisStatus.FAILED.value
+                            rec.output_json = json.dumps(
+                                {"error": "skipped: target file is under _archive"}
+                            )
+                            await session.commit()
+                            continue
+
                         # Build the context
                         context = await self._build_context(session, task_type, target_id, project_path)
 
@@ -170,6 +181,34 @@ class BackgroundAnalysisRunner:
         finally:
             self.is_running = False
             self.current_task_id = ""
+
+    async def _target_is_archived(self, session, task_type: str, target_id: int) -> bool:
+        """Return True if the target's parent file lives under an _archive path."""
+        file_record = None
+        if task_type == "file":
+            file_record = (
+                await session.execute(select(File).where(File.id == target_id))
+            ).scalar_one_or_none()
+        elif task_type == "symbol":
+            symbol = (
+                await session.execute(select(Symbol).where(Symbol.id == target_id))
+            ).scalar_one_or_none()
+            if symbol:
+                file_record = (
+                    await session.execute(select(File).where(File.id == symbol.file_id))
+                ).scalar_one_or_none()
+        elif task_type == "equation":
+            equation = (
+                await session.execute(select(Equation).where(Equation.id == target_id))
+            ).scalar_one_or_none()
+            if equation:
+                file_record = (
+                    await session.execute(select(File).where(File.id == equation.file_id))
+                ).scalar_one_or_none()
+        if not file_record:
+            return False
+        path = file_record.path or ""
+        return ("_archive/" in path) or ("_archive\\" in path)
 
     async def _build_context(self, session, task_type: str, target_id: int, project_path: str) -> Optional[dict[str, Any]]:
         """Construct the context variables for the prompt."""
