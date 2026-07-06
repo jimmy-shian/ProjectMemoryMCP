@@ -111,6 +111,25 @@ project.start_analysis_loop(project_path=".")
 project.get_analysis_progress(project_path=".")
 ```
 
+### Knowledge-base guide & stale-file detection
+
+On `project.bootstrap` / index, the server writes an agent-agnostic usage
+guide to `.project-memory/AGENT_GUIDE.md`. Any AI agent that opens the project
+should read it first; it explains the available tools and conventions in a
+vendor-neutral way.
+
+The server also maintains a `.project-memory/change_log.json` snapshot of
+indexed file hashes. On **every** query-tool call it compares the working
+tree to the snapshot and attaches a `staleness_warning` field to the result
+when files have changed / been added / been deleted. Agents should re-run
+analysis when warned:
+
+```text
+project.check_staleness(project_path=".")
+project.rescan_changed_files(project_path=".")
+project.start_analysis_loop(project_path=".")
+```
+
 If local analysis is unavailable and the user permits agent-driven analysis:
 
 ```text

@@ -84,6 +84,18 @@ class IndexRepositoryWorkflow:
             "errors": [],
         }
 
+        # Step 0: Write the agent-agnostic knowledge-base usage guide into
+        # .project-memory/ so any AI agent that opens the project learns how
+        # to use the knowledge base. Done before scanning so the guide exists
+        # even if a later step fails.
+        print("Step 0: Writing AGENT_GUIDE.md...")
+        try:
+            from project_memory_mcp.workflows.write_agent_guide import write_agent_guide
+
+            write_agent_guide(self.project_path)
+        except Exception as e:
+            results["errors"].append(f"Error writing AGENT_GUIDE.md: {e}")
+
         # Step 1: Scan files
         print("Step 1: Scanning files...")
         file_infos = self.scanner.scan()
