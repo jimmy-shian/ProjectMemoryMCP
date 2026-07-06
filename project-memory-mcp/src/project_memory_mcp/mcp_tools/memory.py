@@ -151,6 +151,18 @@ class GetAnalysisProgressOutput(BaseModel):
     failed_tasks: int
 
 
+class CheckStalenessInput(BaseModel):
+    project_path: str = Field(default=".", description="Path to the project root")
+
+
+class CheckStalenessOutput(BaseModel):
+    stale: bool
+    changed_files: list[str] = []
+    deleted_files: list[str] = []
+    added_files: list[str] = []
+    action: str
+
+
 
 def _project_root(project_path: str) -> Path:
     """Resolve the project root, defaulting to cwd."""
@@ -872,4 +884,27 @@ async def register_memory_tools(server: Server) -> None:
             pending_tasks=pending_tasks,
             completed_tasks=completed_tasks,
             failed_tasks=failed_tasks,
+        )
+
+    @server.tool()
+    async def project_check_staleness(input: CheckStalenessInput) -> CheckStalenessOutput:
+        """
+        Proactively check whether the working tree has diverged from the
+        indexed knowledge base (files changed / added / deleted since the last
+        rescan). Returns the diff and an action string.
+
+        Agents should call this (or watch the ``staleness_warning`` field
+        attached to query-tool results) and, when ``stale`` is true, run
+        ``project.rescan_changed_files`` followed by ``project.start_analysis_loop``
+        to re-analyze **before** trusting descriptions from the graph.
+        """
+        from project_memory_mcp.utils.staleness_checker import check_staleness
+
+        result = check_staleness(input.project_path)
+        return CheckStalenessOutput(
+            stale=result["stale"],
+            changed_files=result["changed_files"],
+            deleted_files=result["deleted_files"],
+            added_files=result["added_files"],
+            action=result["action"],
         )
