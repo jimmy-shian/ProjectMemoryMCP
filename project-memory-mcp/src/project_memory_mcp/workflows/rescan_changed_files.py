@@ -121,6 +121,16 @@ class RescanChangedFilesWorkflow:
         print("Step 4: Updating graph edges...")
         await self._update_graph_edges()
 
+        # Step 5: Refresh the staleness snapshot to reflect the reconciled DB
+        # state, so the next tool call no longer reports these same changes.
+        print("Step 5: Refreshing staleness snapshot...")
+        try:
+            from project_memory_mcp.utils.staleness_checker import refresh_snapshot_async
+
+            await refresh_snapshot_async(self.project_path)
+        except Exception as e:
+            results["errors"].append(f"Error refreshing staleness snapshot: {e}")
+
         # Record operation
         await self._record_operation("rescan", results)
 

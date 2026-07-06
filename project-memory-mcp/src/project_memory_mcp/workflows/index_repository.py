@@ -111,6 +111,16 @@ class IndexRepositoryWorkflow:
             print("Step 5: Generating PROJECT_AGENT_MANUAL...")
             await self._generate_manual()
 
+        # Step 6: Refresh the staleness snapshot so subsequent tool calls
+        # compare against the freshly-indexed ground truth.
+        print("Step 6: Refreshing staleness snapshot...")
+        try:
+            from project_memory_mcp.utils.staleness_checker import refresh_snapshot_async
+
+            await refresh_snapshot_async(self.project_path)
+        except Exception as e:
+            results["errors"].append(f"Error refreshing staleness snapshot: {e}")
+
         # Record operation
         await self._record_operation("index", results)
 
