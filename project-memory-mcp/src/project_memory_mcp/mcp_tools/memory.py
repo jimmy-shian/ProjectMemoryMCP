@@ -565,7 +565,7 @@ async def register_memory_tools(server: Server) -> None:
             agent_response=input.analysis,
         )
 
-        if validated.status != AnalysisStatus.COMPLETED:
+        if validated.status.value != AnalysisStatus.COMPLETED.value:
             return SubmitFileAnalysisOutput(
                 accepted=False,
                 db_updated=False,
@@ -640,7 +640,7 @@ async def register_memory_tools(server: Server) -> None:
             agent_response=input.analysis,
         )
 
-        if validated.status != AnalysisStatus.COMPLETED:
+        if validated.status.value != AnalysisStatus.COMPLETED.value:
             return SubmitSymbolAnalysisOutput(
                 accepted=False,
                 db_updated=False,
@@ -709,7 +709,7 @@ async def register_memory_tools(server: Server) -> None:
             agent_response=input.analysis,
         )
 
-        if validated.status != AnalysisStatus.COMPLETED:
+        if validated.status.value != AnalysisStatus.COMPLETED.value:
             return SubmitEquationAnalysisOutput(
                 accepted=False,
                 db_updated=False,
