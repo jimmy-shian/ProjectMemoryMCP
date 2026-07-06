@@ -6,6 +6,29 @@ from mcp.server import Server
 from pydantic import BaseModel, Field
 
 
+def _staleness_warning(project_path: str) -> dict[str, Any]:
+    """Run a cheap staleness check and return a warning dict for tool output.
+
+    The result is attached to every query tool response so the calling agent
+    learns *immediately* when the on-disk tree has diverged from the indexed
+    knowledge base, rather than discovering it lazily when a stale record is
+    used. On any error the warning is a benign ``stale=False`` so it never
+    blocks the tool call.
+    """
+    try:
+        from project_memory_mcp.utils.staleness_checker import check_staleness
+
+        return check_staleness(project_path)
+    except Exception as exc:
+        return {
+            "stale": False,
+            "changed_files": [],
+            "deleted_files": [],
+            "added_files": [],
+            "action": f"Staleness check skipped ({exc}).",
+        }
+
+
 class SearchFilesInput(BaseModel):
     project_path: str = Field(default=".", description="Path to the project root")
     query: str = Field(
@@ -23,6 +46,10 @@ class SearchFilesOutput(BaseModel):
     query: str
     total: int
     files: list[dict[str, Any]]
+    staleness_warning: dict[str, Any] = Field(
+        default_factory=dict,
+        description="If stale, files have changed/deleted/added since last index; re-analyze.",
+    )
 
 
 class QueryFileInput(BaseModel):
@@ -36,6 +63,10 @@ class QueryFileOutput(BaseModel):
     symbols: list[dict[str, Any]] = []
     equations: list[dict[str, Any]] = []
     dependencies: list[dict[str, Any]] = []
+    staleness_warning: dict[str, Any] = Field(
+        default_factory=dict,
+        description="If stale, files have changed/deleted/added since last index; re-analyze.",
+    )
 
 
 class QuerySymbolInput(BaseModel):
@@ -51,6 +82,10 @@ class QuerySymbolOutput(BaseModel):
     callees: list[dict[str, Any]] = []
     equations: list[dict[str, Any]] = []
     impact: dict[str, Any] | None = None
+    staleness_warning: dict[str, Any] = Field(
+        default_factory=dict,
+        description="If stale, files have changed/deleted/added since last index; re-analyze.",
+    )
 
 
 class QueryEquationInput(BaseModel):
@@ -64,6 +99,10 @@ class QueryEquationOutput(BaseModel):
     equations: list[dict[str, Any]] = []
     variables: list[dict[str, Any]] = []
     related_symbols: list[dict[str, Any]] = []
+    staleness_warning: dict[str, Any] = Field(
+        default_factory=dict,
+        description="If stale, files have changed/deleted/added since last index; re-analyze.",
+    )
 
 
 class QueryImpactInput(BaseModel):
@@ -82,6 +121,10 @@ class QueryImpactOutput(BaseModel):
     risk_summary: str = ""
     suggested_tests: list[str] = []
     suggested_order: list[str] = []
+    staleness_warning: dict[str, Any] = Field(
+        default_factory=dict,
+        description="If stale, files have changed/deleted/added since last index; re-analyze.",
+    )
 
 
 async def register_query_tools(server: Server) -> None:
@@ -147,6 +190,7 @@ async def register_query_tools(server: Server) -> None:
                     "analysis_status": f.analysis_status,
                     "llm_confidence": f.llm_confidence,
                 } for f in ordered],
+                staleness_warning=_staleness_warning(input.project_path),
             )
 
     @server.tool()
@@ -228,6 +272,7 @@ async def register_query_tools(server: Server) -> None:
                     "mathematical_meaning": e.mathematical_meaning,
                 } for e in equations],
                 dependencies=dependencies,
+                staleness_warning=_staleness_warning(input.project_path),
             )
 
     @server.tool()
@@ -331,6 +376,7 @@ async def register_query_tools(server: Server) -> None:
                 callers=callers,
                 callees=callees,
                 equations=equations,
+                staleness_warning=_staleness_warning(input.project_path),
             )
 
     @server.tool()
@@ -427,6 +473,7 @@ async def register_query_tools(server: Server) -> None:
                 equations=eq_list,
                 variables=all_variables,
                 related_symbols=all_symbols,
+                staleness_warning=_staleness_warning(input.project_path),
             )
 
     @server.tool()
@@ -448,6 +495,7 @@ async def register_query_tools(server: Server) -> None:
             return QueryImpactOutput(
                 success=False,
                 risk_summary=result.get("error", "Unknown error"),
+                staleness_warning=_staleness_warning(input.project_path),
             )
 
         affected = result.get("affected", {})
@@ -460,4 +508,5 @@ async def register_query_tools(server: Server) -> None:
             risk_summary="Impact analysis created. Submit analysis via project.submit_impact_analysis for detailed risk assessment.",
             suggested_tests=result.get("test_files", []),
             suggested_order=[],
+            staleness_warning=_staleness_warning(input.project_path),
         )
