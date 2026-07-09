@@ -927,6 +927,67 @@ def get_semantic_info(source: str, file_path: str) -> dict:
 
 ---
 
+## 6. Parallel Indexing & Dependency-Aware Analysis Pipeline
+
+### 6.1 Problem Statement
+When indexing large codebases with hundreds of files, sequentially parsing every file via Tree-sitter and generating summaries using LLM endpoints creates a massive bottleneck. LLM API network roundtrips (often taking 1-3 seconds per file) are particularly expensive. A naive concurrent implementation that fires requests for all files simultaneously will:
+1. Violate Rate Limits (HTTP 429) on LLM Gateways.
+2. Generate suboptimal LLM analysis, since child classes or functions are analyzed before their parents' contextual summaries exist.
+
+### 6.2 Architecture of the Parallel Pipeline
+The Project Memory MCP implements a hybrid, dependency-aware parallel processing pipeline that optimizes local compute (parsing ASTs) and remote network calls (LLM summaries).
+
+```
+[Scan Workspace File Paths]
+          │
+          ▼
+[Step 1: Extract AST Imports/Symbols in Thread Pool (ParallelStaticAnalyzer)]
+          │
+          ▼
+[Step 2: Build Dependency Graph (DependencyGraphBuilder)]
+          │
+          ▼
+[Step 3: Kahn's Topological Sort (TopologicalSorter)]
+          │
+          ▼
+[Step 4: Group Files into Independent Levels (AnalysisGroup)]
+          │
+          ▼
+[Step 5: Process Levels Sequentially, and Files inside each level Concurrently]
+   ├─► Level 0: [File_A (No deps)]  [File_B (No deps)]   (Semaphore Limit = 2)
+   │               │                   │
+   │               └─────────┬─────────┘ (Complete)
+   ▼                         ▼
+   └─► Level 1: [File_C (Depends on A/B)]                (LLM references parent contexts)
+```
+
+### 6.3 Kahn's Algorithm for Topological Levels
+To sort the source files so that dependents are analyzed after their dependencies, we model files as vertices $V$ and imports/calls as directed edges $E$. We use **Kahn's Algorithm** to compute topological levels:
+
+1. **In-degree Count**: Calculate $in\_degree[v]$ (the number of incoming dependencies for each file).
+2. **Level Initialization**: Identify all files with $in\_degree[v] = 0$. These form `Level 0` (independent files).
+3. **Iterative Reduction**: For each level, process its files. For each processed file $u$, locate all dependent files $w$ (where there is a directed dependency edge $u \to w$). Decrement $in\_degree[w]$ by 1.
+4. **Next Level**: All files $w$ whose $in\_degree[w]$ drops to $0$ are assigned to the next topological level, to be processed in the next parallel batch.
+
+This guarantees that a child class or function file is analyzed only after its base class/module file's LLM summary is fully generated and cached in the SQLite database, enabling the LLM to access the parent's context.
+
+### 6.4 Concurrency Control Mechanisms
+To balance processing speed and resource consumption:
+1. **Thread Pool Executor**: CPU-bound tree-sitter parses run in a `concurrent.futures.ThreadPoolExecutor` (configured via `max_workers`). This keeps the event loop unblocked.
+2. **asyncio.Semaphore**: Network-bound LLM tasks are scheduled concurrently using an `asyncio.Semaphore(max_llm_concurrent)` to strictly limit concurrent connections and prevent HTTP 429 rate limit cooling states in the LLM Gateway.
+3. **Batching**: Files are processed in configurable chunk batches (`batch_size`) during static analysis to avoid memory spikes.
+
+### 6.5 Performance Comparison (Qualitative)
+
+| Metric | Sequential Pipeline | Parallel Dependency-Aware Pipeline |
+|--------|---------------------|-----------------------------------|
+| **Static Parsing Speed** | $O(N)$ sequential thread blocks | $O(N / \text{workers})$ using worker thread pools |
+| **LLM Call Speed** | $O(N \times \text{RTT})$ | $O(L \times \text{RTT} + (N / \text{max\_llm}))$, where $L$ is number of levels |
+| **Contextual Accuracy** | Low (random order, missing parent context) | **High** (dependents always refer to pre-analyzed parent summaries) |
+| **Gateway Rate Limits** | Minimal risk (slow) | **Managed** (bounded by semaphore, no 429 triggers) |
+
+---
+
 ## Summary: Architecture Recommendations
 
 | Layer | Recommended Technology | Rationale |
