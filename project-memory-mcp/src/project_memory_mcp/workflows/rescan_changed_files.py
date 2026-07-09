@@ -15,6 +15,8 @@ from project_memory_mcp.db.models import (
     LLMAnalysisRecord,
     OperationsHistory,
     Symbol,
+    Equation,
+    Variable,
 )
 from project_memory_mcp.llm_analysis.analyzer import get_analyzer
 from project_memory_mcp.static_analysis.file_scanner import FileScanner
@@ -217,54 +219,377 @@ class RescanChangedFilesWorkflow:
 
     async def _clear_file_data(self, file_id: int, session) -> None:
         """Clear all data associated with a file."""
-        # Delete symbols (cascades to equations, variables via foreign keys)
         # Get symbol IDs for this file
         stmt = select(Symbol.id).where(Symbol.file_id == file_id)
         result = await session.execute(stmt)
         symbol_ids = [row[0] for row in result.all()]
 
-        # Delete graph edges involving these symbols
+        # Get equation IDs for this file
+        stmt = select(Equation.id).where(Equation.file_id == file_id)
+        result = await session.execute(stmt)
+        equation_ids = [row[0] for row in result.all()]
+
+        # Get variable IDs for this file
+        stmt = select(Variable.id).where(Variable.file_id == file_id)
+        result = await session.execute(stmt)
+        variable_ids = [row[0] for row in result.all()]
+
+        # Delete graph edges involving file, symbols, equations, variables
+        targets = []
         if symbol_ids:
-            stmt = delete(GraphEdge).where(
-                (GraphEdge.source_type == "symbol") & (GraphEdge.source_id.in_(symbol_ids)) |
-                (GraphEdge.target_type == "symbol") & (GraphEdge.target_id.in_(symbol_ids))
-            )
+            targets.append((GraphEdge.source_type == "symbol") & (GraphEdge.source_id.in_(symbol_ids)))
+            targets.append((GraphEdge.target_type == "symbol") & (GraphEdge.target_id.in_(symbol_ids)))
+        if equation_ids:
+            targets.append((GraphEdge.source_type == "equation") & (GraphEdge.source_id.in_(equation_ids)))
+            targets.append((GraphEdge.target_type == "equation") & (GraphEdge.target_id.in_(equation_ids)))
+        if variable_ids:
+            targets.append((GraphEdge.source_type == "variable") & (GraphEdge.source_id.in_(variable_ids)))
+            targets.append((GraphEdge.target_type == "variable") & (GraphEdge.target_id.in_(variable_ids)))
+        
+        targets.append((GraphEdge.source_type == "file") & (GraphEdge.source_id == file_id))
+        targets.append((GraphEdge.target_type == "file") & (GraphEdge.target_id == file_id))
+
+        from sqlalchemy import or_
+        if targets:
+            stmt = delete(GraphEdge).where(or_(*targets))
             await session.execute(stmt)
 
-            # Delete LLM analysis records for these symbols
-            stmt = delete(LLMAnalysisRecord).where(
+        # Mark LLM analysis records as stale instead of deleting
+        if symbol_ids:
+            stmt = select(LLMAnalysisRecord).where(
                 (LLMAnalysisRecord.target_type == "symbol") & (LLMAnalysisRecord.target_id.in_(symbol_ids))
             )
-            await session.execute(stmt)
-
-        # Delete graph edges for this file
-        stmt = delete(GraphEdge).where(
-            (GraphEdge.source_type == "file") & (GraphEdge.source_id == file_id) |
-            (GraphEdge.target_type == "file") & (GraphEdge.target_id == file_id)
-        )
-        await session.execute(stmt)
-
-        # Delete LLM analysis records for this file (target_type="file")
-        stmt = delete(LLMAnalysisRecord).where(
+            records = (await session.execute(stmt)).scalars().all()
+            for r in records:
+                r.status = "stale"
+        if equation_ids:
+            stmt = select(LLMAnalysisRecord).where(
+                (LLMAnalysisRecord.target_type == "equation") & (LLMAnalysisRecord.target_id.in_(equation_ids))
+            )
+            records = (await session.execute(stmt)).scalars().all()
+            for r in records:
+                r.status = "stale"
+        
+        stmt = select(LLMAnalysisRecord).where(
             (LLMAnalysisRecord.target_type == "file") & (LLMAnalysisRecord.target_id == file_id)
         )
-        await session.execute(stmt)
+        records = (await session.execute(stmt)).scalars().all()
+        for r in records:
+            r.status = "stale"
+
+        # Delete variables, equations, symbols
+        if variable_ids:
+            stmt = delete(Variable).where(Variable.id.in_(variable_ids))
+            await session.execute(stmt)
+        if equation_ids:
+            stmt = delete(Equation).where(Equation.id.in_(equation_ids))
+            await session.execute(stmt)
+        if symbol_ids:
+            stmt = delete(Symbol).where(Symbol.id.in_(symbol_ids))
+            await session.execute(stmt)
+
+    def _find_enclosing_symbol(self, call_entity, analysis) -> Any | None:
+        """Find the symbol that encloses a call."""
+        for func in analysis.functions:
+            if func.start_line <= call_entity.start_line <= func.end_line:
+                return func
+        for cls in analysis.classes:
+            if cls.start_line <= call_entity.start_line <= cls.end_line:
+                return cls
+        return None
+
+    async def _detect_equations(
+        self,
+        file_record: File,
+        analysis,
+        session,
+        results: dict[str, Any],
+    ) -> None:
+        """Detect mathematical equations in the code."""
+        for func in analysis.functions:
+            source = func.source_text.lower()
+            equation_keywords = [
+                "loss", "gradient", "optimizer", "backprop", "forward",
+                "pid", "control", "matrix", "tensor", "eigen",
+                "sigmoid", "softmax", "relu", "activation",
+                "convolution", "pooling", "attention",
+                "kalman", "filter", "estimate", "predict",
+                "integral", "derivative", "differential",
+            ]
+
+            if any(kw in source for kw in equation_keywords):
+                equation = Equation(
+                    file_id=file_record.id,
+                    symbol_id=None,  # Will be linked later
+                    name=func.name,
+                    equation_type="algorithmic",
+                    expression=func.source_text[:500],
+                    start_line=func.start_line,
+                    end_line=func.end_line,
+                    confidence=0.5,
+                    inferred=True,
+                )
+                session.add(equation)
+                await session.flush()
+                results["equations_updated"] += 1
+
+    async def _create_static_edges(
+        self,
+        file_record: File,
+        analysis,
+        session,
+        new_symbols_info: dict[str, int],
+    ) -> None:
+        """Create static graph edges for DEFINES, IMPORTS, CALLS."""
+        file_id = file_record.id
+
+        # DEFINES edges
+        for qualified_name, symbol_id in new_symbols_info.items():
+            edge = GraphEdge(
+                source_type="file",
+                source_id=file_id,
+                target_type="symbol",
+                target_id=symbol_id,
+                edge_type="DEFINES",
+                evidence="tree-sitter static analysis",
+                confidence=1.0,
+                created_by="static_locator",
+            )
+            try:
+                async with session.begin_nested():
+                    session.add(edge)
+            except Exception:
+                pass
+
+        # IMPORTS edges
+        seen_imports = set()
+        for imp in analysis.imports:
+            key = f"IMPORTS:{imp.name}"
+            if key in seen_imports:
+                continue
+            seen_imports.add(key)
+            edge = GraphEdge(
+                source_type="file",
+                source_id=file_id,
+                target_type="file",
+                target_id=0,
+                edge_type="IMPORTS",
+                evidence=f"Import: {imp.name}",
+                confidence=1.0,
+                created_by="static_locator",
+            )
+            try:
+                async with session.begin_nested():
+                    session.add(edge)
+            except Exception:
+                pass
+
+        # CALLS edges
+        seen_calls = set()
+        for call in analysis.calls:
+            caller = self._find_enclosing_symbol(call, analysis)
+            if caller and caller.qualified_name in new_symbols_info:
+                caller_id = new_symbols_info[caller.qualified_name]
+                ckey = f"CALLS:{caller_id}:{call.name}"
+                if ckey in seen_calls:
+                    continue
+                seen_calls.add(ckey)
+                edge = GraphEdge(
+                    source_type="symbol",
+                    source_id=caller_id,
+                    target_type="symbol",
+                    target_id=0,
+                    edge_type="CALLS",
+                    evidence=f"Call to {call.name}",
+                    confidence=0.8,
+                    created_by="static_locator",
+                )
+                try:
+                    async with session.begin_nested():
+                        session.add(edge)
+                except Exception:
+                    pass
 
     async def _extract_and_store_structure(
         self,
         file_record: File,
         file_info,
         session,
+        results: dict[str, Any] | None = None,
     ) -> None:
         """Extract static structure and store in database."""
-        # Similar to IndexRepositoryWorkflow._extract_static_structure
-        # Simplified for now
-        pass
+        try:
+            analysis = self.locator.analyze_file(file_info.path)
+            new_symbols_info = {}
+            results_dict = {"symbols_updated": 0, "equations_updated": 0}
+
+            # Create Symbol records
+            for func in analysis.functions:
+                symbol = Symbol(
+                    file_id=file_record.id,
+                    name=func.name,
+                    qualified_name=func.qualified_name,
+                    symbol_type="function",
+                    start_line=func.start_line,
+                    end_line=func.end_line,
+                    start_byte=func.start_byte,
+                    end_byte=func.end_byte,
+                    signature=func.metadata.get("parameters", ""),
+                    docstring=func.metadata.get("docstring", ""),
+                )
+                session.add(symbol)
+                await session.flush()
+                new_symbols_info[func.qualified_name] = symbol.id
+                results_dict["symbols_updated"] += 1
+
+            for cls in analysis.classes:
+                symbol = Symbol(
+                    file_id=file_record.id,
+                    name=cls.name,
+                    qualified_name=cls.qualified_name,
+                    symbol_type="class",
+                    start_line=cls.start_line,
+                    end_line=cls.end_line,
+                    start_byte=cls.start_byte,
+                    end_byte=cls.end_byte,
+                    docstring=cls.metadata.get("docstring", ""),
+                )
+                session.add(symbol)
+                await session.flush()
+                new_symbols_info[cls.qualified_name] = symbol.id
+                results_dict["symbols_updated"] += 1
+
+            for var in analysis.variables:
+                symbol = Symbol(
+                    file_id=file_record.id,
+                    name=var.name,
+                    qualified_name=var.qualified_name,
+                    symbol_type="variable",
+                    start_line=var.start_line,
+                    end_line=var.end_line,
+                    start_byte=var.start_byte,
+                    end_byte=var.end_byte,
+                )
+                session.add(symbol)
+                await session.flush()
+                new_symbols_info[var.qualified_name] = symbol.id
+                results_dict["symbols_updated"] += 1
+
+            # Update results if provided
+            if results is not None:
+                results["symbols_updated"] += results_dict["symbols_updated"]
+
+            # Create static edges (DEFINES, IMPORTS, CALLS)
+            await self._create_static_edges(file_record, analysis, session, new_symbols_info)
+
+            # Detect equations
+            await self._detect_equations(file_record, analysis, session, results_dict)
+            if results is not None:
+                results["equations_updated"] += results_dict["equations_updated"]
+
+        except Exception as e:
+            print(f"Error extracting static structure for {file_record.path}: {e}")
 
     async def _update_graph_edges(self) -> None:
-        """Update graph edges after changes."""
-        # Rebuild edges for affected files
-        pass
+        """Update graph edges after changes.
+
+        IMPORTS and CALLS edges are re-resolved in place against the current
+        file/symbol maps. Each edge keeps its existing (already-unique)
+        ``target_id`` until a fresh resolution is computed, so we never issue
+        a blanket ``UPDATE ... SET target_id=0`` that would collapse distinct
+        edges from the same source onto the same key and trip the
+        ``uq_edge_unique`` constraint. Edges that can no longer be resolved,
+        or that would duplicate a just-resolved edge, are deleted instead.
+        """
+        from sqlalchemy import delete, select
+
+        async with get_session() as session:
+            # 1. Clear LLM-derived edges database-wide
+            await session.execute(delete(GraphEdge).where(
+                GraphEdge.edge_type.in_([
+                    "USES_EQUATION", "EQUATION_INPUT", "EQUATION_OUTPUT",
+                    "EQUATION_INTERMEDIATE", "EQUATION_DEPENDS_ON"
+                ])
+            ))
+
+            # 2. Resolve imports database-wide (in place, no blanket reset)
+            files_result = await session.execute(select(File))
+            file_map = {f.path: f for f in files_result.scalars().all()}
+
+            def resolve_import(module_name: str) -> int | None:
+                for f_path, f_rec in file_map.items():
+                    if f_path.replace("/", ".").replace(".py", "") == module_name:
+                        return f_rec.id
+                    if f_rec.filename.replace(".py", "") == module_name.rsplit(".", maxsplit=1)[-1]:
+                        return f_rec.id
+                return None
+
+            import_edges = (
+                await session.execute(select(GraphEdge).where(GraphEdge.edge_type == "IMPORTS"))
+            ).scalars().all()
+            deleted = self._dedup_resolve_edges(
+                import_edges,
+                lambda ev: ev.replace("Import: ", "").strip(),
+                lambda name: resolve_import(name),
+            )
+            if deleted:
+                await session.execute(
+                    delete(GraphEdge).where(GraphEdge.id.in_(deleted))
+                )
+
+            # 3. Resolve calls database-wide (in place, no blanket reset)
+            symbols_result = await session.execute(select(Symbol))
+            symbol_map = {s.qualified_name or s.name: s for s in symbols_result.scalars().all()}
+
+            call_edges = (
+                await session.execute(select(GraphEdge).where(GraphEdge.edge_type == "CALLS"))
+            ).scalars().all()
+            deleted = self._dedup_resolve_edges(
+                call_edges,
+                lambda ev: ev.replace("Call to ", "").strip(),
+                lambda name: symbol_map[name].id if name in symbol_map else None,
+            )
+            if deleted:
+                await session.execute(
+                    delete(GraphEdge).where(GraphEdge.id.in_(deleted))
+                )
+
+            # 4. Build LLM-derived edges database-wide
+            await add_llm_derived_edges(session)
+
+    @staticmethod
+    def _dedup_resolve_edges(
+        edges,
+        extract_name,
+        resolve_target_id,
+    ) -> list[int]:
+        """Re-resolve edges in place, returning ids of edges to delete.
+
+        For each edge, ``extract_name(edge.evidence)`` yields the lookup key and
+        ``resolve_target_id(name)`` yields the new target id (or ``None`` if
+        unresolvable). Edges that can't be resolved, or that would duplicate a
+        just-resolved edge (same ``uq_edge_unique`` key), are collected for
+        deletion instead of being collapsed onto a shared key.
+        """
+        seen: set[tuple[str, int, str, int, str]] = set()
+        to_delete: list[int] = []
+        for edge in edges:
+            name = extract_name(edge.evidence or "")
+            tid = resolve_target_id(name)
+            if not tid:
+                to_delete.append(edge.id)
+                continue
+            key = (
+                edge.source_type, edge.source_id,
+                edge.target_type, tid, edge.edge_type,
+            )
+            if key in seen:
+                to_delete.append(edge.id)
+                continue
+            seen.add(key)
+            edge.target_id = tid
+            edge.confidence = 0.9
+        return to_delete
 
     async def _record_operation(self, operation_type: str, results: dict[str, Any]) -> None:
         """Record the rescan operation."""
@@ -282,3 +607,157 @@ async def rescan_changed_files(project_path: str, config: dict[str, Any] | None 
     """Convenience function to run the rescan workflow."""
     workflow = RescanChangedFilesWorkflow(project_path, config)
     return await workflow.execute()
+
+
+async def add_llm_derived_edges(session) -> None:
+    """Add edges derived from completed, non-stale LLM analysis records."""
+    from sqlalchemy import select
+    from project_memory_mcp.db.models import LLMAnalysisRecord, Symbol, Equation, Variable, GraphEdge, File
+    import json
+
+    async def add_edge_if_not_exists(
+        source_type: str,
+        source_id: int,
+        target_type: str,
+        target_id: int,
+        edge_type: str,
+        evidence: str,
+        confidence: float,
+    ) -> None:
+        stmt = select(GraphEdge).where(
+            (GraphEdge.source_type == source_type) &
+            (GraphEdge.source_id == source_id) &
+            (GraphEdge.target_type == target_type) &
+            (GraphEdge.target_id == target_id) &
+            (GraphEdge.edge_type == edge_type)
+        )
+        existing = (await session.execute(stmt)).scalar_one_or_none()
+        if existing:
+            return
+
+        edge = GraphEdge(
+            source_type=source_type,
+            source_id=source_id,
+            target_type=target_type,
+            target_id=target_id,
+            edge_type=edge_type,
+            evidence=evidence,
+            confidence=confidence,
+            created_by="llm_analyzer"
+        )
+        try:
+            async with session.begin_nested():
+                session.add(edge)
+                await session.flush()
+        except Exception:
+            pass
+
+    # 1. Fetch completed, non-stale analysis records
+    stmt = select(LLMAnalysisRecord).where(LLMAnalysisRecord.status == "completed")
+    records = (await session.execute(stmt)).scalars().all()
+
+    for record in records:
+        try:
+            output_data = json.loads(record.output_json) if isinstance(record.output_json, str) else record.output_json
+        except Exception:
+            continue
+
+        if not output_data:
+            continue
+
+        # For Symbol records
+        if record.target_type == "symbol":
+            # Verify target Symbol and File still exist and are valid
+            sym_stmt = select(Symbol).where(Symbol.id == record.target_id)
+            symbol = (await session.execute(sym_stmt)).scalar_one_or_none()
+            if not symbol:
+                continue
+
+            file_stmt = select(File).where(File.id == symbol.file_id)
+            file_rec = (await session.execute(file_stmt)).scalar_one_or_none()
+            if not file_rec:
+                continue
+
+            related_eqs = output_data.get("related_equations", [])
+            for eq_name in related_eqs:
+                if not eq_name:
+                    continue
+                # Try finding Equation in the same file first
+                eq_stmt = select(Equation).where(
+                    (Equation.file_id == symbol.file_id) & (Equation.name == eq_name)
+                )
+                eq_rec = (await session.execute(eq_stmt)).scalar_one_or_none()
+                if not eq_rec:
+                    # Fallback to global query
+                    eq_stmt = select(Equation).where(Equation.name == eq_name)
+                    eq_rec = (await session.execute(eq_stmt)).scalar_one_or_none()
+
+                if eq_rec:
+                    await add_edge_if_not_exists(
+                        source_type="symbol",
+                        source_id=symbol.id,
+                        target_type="equation",
+                        target_id=eq_rec.id,
+                        edge_type="USES_EQUATION",
+                        evidence=f"LLM symbol analysis of {symbol.name}",
+                        confidence=record.confidence or 0.8,
+                    )
+
+        # For Equation records
+        elif record.target_type == "equation":
+            # Verify target Equation and File still exist
+            eq_stmt = select(Equation).where(Equation.id == record.target_id)
+            equation = (await session.execute(eq_stmt)).scalar_one_or_none()
+            if not equation:
+                continue
+
+            file_stmt = select(File).where(File.id == equation.file_id)
+            file_rec = (await session.execute(file_stmt)).scalar_one_or_none()
+            if not file_rec:
+                continue
+
+            # We extract variables: Inputs, Outputs, Intermediate, Constants
+            var_groups = [
+                ("inputs", "input", "EQUATION_INPUT"),
+                ("outputs", "output", "EQUATION_OUTPUT"),
+                ("intermediate_variables", "intermediate", "EQUATION_INTERMEDIATE"),
+                ("constants", "constant", "EQUATION_DEPENDS_ON")
+            ]
+
+            for group_key, var_role, edge_type in var_groups:
+                var_names = output_data.get(group_key, [])
+                for name in var_names:
+                    if not name:
+                        continue
+
+                    # Upsert Variable using file_id, symbol_id, name, role
+                    symbol_id = equation.symbol_id
+                    var_stmt = select(Variable).where(
+                        (Variable.file_id == equation.file_id) &
+                        (Variable.symbol_id == symbol_id) &
+                        (Variable.name == name) &
+                        (Variable.role == var_role)
+                    )
+                    variable = (await session.execute(var_stmt)).scalar_one_or_none()
+
+                    if not variable:
+                        variable = Variable(
+                            file_id=equation.file_id,
+                            symbol_id=symbol_id,
+                            name=name,
+                            role=var_role,
+                            confidence=record.confidence or 0.8,
+                        )
+                        session.add(variable)
+                        await session.flush()
+
+                    # Create directed edge: Equation -> Variable
+                    await add_edge_if_not_exists(
+                        source_type="equation",
+                        source_id=equation.id,
+                        target_type="variable",
+                        target_id=variable.id,
+                        edge_type=edge_type,
+                        evidence=f"LLM equation analysis of {equation.name or 'unnamed'}",
+                        confidence=record.confidence or 0.8,
+                    )

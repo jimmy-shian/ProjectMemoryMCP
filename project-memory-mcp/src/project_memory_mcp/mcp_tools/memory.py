@@ -12,12 +12,16 @@ class BootstrapInput(BaseModel):
     project_path: str = Field(default=".", description="Path to the project root")
     mode: str = Field(default="agent_driven", description="LLM mode: agent_driven or server_driven")
     use_vector_similarity: bool = Field(default=False, description="Whether to use vector similarity")
+    parallel: bool = Field(default=False, description="Enable parallel analysis")
+    parallel_max_workers: int = Field(default=4, description="Max parallel workers")
+    parallel_max_llm_concurrent: int = Field(default=2, description="Max concurrent LLM calls")
 
 
 class BootstrapOutput(BaseModel):
     created: bool
     memory_dir: str
     next_step: str
+    parallel: bool = False
 
 
 class PlanIndexingInput(BaseModel):
@@ -129,6 +133,7 @@ class StartAnalysisLoopInput(BaseModel):
     llm_api_key: str | None = Field(default=None, description="LLM API key")
     llm_model: str | None = Field(default=None, description="LLM model name")
     llm_api_base: str | None = Field(default=None, description="LLM API base URL")
+    parallel: bool = Field(default=False, description="Enable parallel LLM analysis")
 
 
 class StartAnalysisLoopOutput(BaseModel):
@@ -328,12 +333,15 @@ async def register_memory_tools(server: Server) -> None:
         """
         Initialize a new project memory directory.
         Creates .project-memory/ with config.yaml, project_knowledge.db, and initial state.
+        Supports parallel analysis when `parallel` is True.
         """
         from project_memory_mcp.workflows.index_repository import index_repository
 
         config = {
             "mode": input.mode,
             "use_vector_similarity": input.use_vector_similarity,
+            "parallel_enable_static": input.parallel,
+            "parallel_enable_llm": input.parallel,
         }
 
         await index_repository(input.project_path, config)
@@ -342,6 +350,7 @@ async def register_memory_tools(server: Server) -> None:
             created=True,
             memory_dir=".project-memory",
             next_step="project.get_next_analysis_task",
+            parallel=input.parallel,
         )
 
     @server.tool()
@@ -809,6 +818,8 @@ async def register_memory_tools(server: Server) -> None:
            run agent-driven analysis.
         3. If the user does not permit agent-driven analysis, keep the static
            knowledge graph only; file/symbol/import/call records remain queryable.
+        
+        Supports parallel LLM analysis when `parallel` is True.
         """
         import project_memory_mcp.llm_analysis.analyzer as analyzer_mod
         from project_memory_mcp.utils.config import get_settings, reset_settings
@@ -844,7 +855,7 @@ async def register_memory_tools(server: Server) -> None:
                 )
 
         # Start background loop
-        msg = runner.start(input.project_path)
+        msg = runner.start(input.project_path, parallel=input.parallel)
         return StartAnalysisLoopOutput(started=runner.is_running, message=msg)
 
     @server.tool()

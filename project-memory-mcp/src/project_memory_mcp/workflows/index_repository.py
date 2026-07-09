@@ -15,9 +15,14 @@ from project_memory_mcp.db.models import (
     OperationsHistory,
     Symbol,
 )
-from project_memory_mcp.llm_analysis.analyzer import AnalysisStatus, get_analyzer
+from project_memory_mcp.llm_analysis.analyzer import AnalysisStatus as LLMAnalysisStatus, get_analyzer
 from project_memory_mcp.static_analysis.file_scanner import FileScanner
 from project_memory_mcp.static_analysis.static_locator import StaticLocator
+from project_memory_mcp.static_analysis.parallel_analysis import (
+    ParallelAnalysisConfig,
+    ParallelAnalysisOrchestrator,
+    create_parallel_analysis_config,
+)
 from project_memory_mcp.utils.config import load_config
 
 
@@ -68,6 +73,15 @@ class IndexRepositoryWorkflow:
         self.symbol_map: dict[str, Symbol] = {}  # qualified_name -> Symbol
         self.equation_map: dict[str, Equation] = {}  # name -> Equation
 
+        # Parallel analysis config
+        self.parallel_config = create_parallel_analysis_config(
+            max_workers=self.config.get("parallel_max_workers", 4),
+            max_llm_concurrent=self.config.get("parallel_max_llm_concurrent", 2),
+            batch_size=self.config.get("parallel_batch_size", 10),
+            enable_parallel_static=self.config.get("parallel_enable_static", True),
+            enable_parallel_llm=self.config.get("parallel_enable_llm", True),
+        )
+
     async def execute(self) -> dict[str, Any]:
         """
         Execute the full indexing workflow.
@@ -96,6 +110,108 @@ class IndexRepositoryWorkflow:
         except Exception as e:
             results["errors"].append(f"Error writing AGENT_GUIDE.md: {e}")
 
+        # Check if parallel analysis is enabled
+        if self.parallel_config.enable_parallel_static or self.parallel_config.enable_parallel_llm:
+            return await self._execute_parallel(results)
+
+        # Original sequential execution
+        return await self._execute_sequential(results)
+
+    async def _execute_parallel(self, results: dict[str, Any]) -> dict[str, Any]:
+        """Execute indexing with parallel analysis."""
+        # Step 1: Scan files
+        print("Step 1: Scanning files...")
+        file_infos = self.scanner.scan()
+        results["files_scanned"] = len(file_infos)
+
+        # Step 2: Run parallel static analysis
+        print("Step 2: Running parallel static analysis and building dependency graph...")
+        orchestrator = ParallelAnalysisOrchestrator(
+            str(self.project_path),
+            self.parallel_config,
+        )
+
+        # Define LLM analysis function for server-driven mode
+        async def llm_analyze_file(file_info):
+            if self.config.get("llm_mode") != "server_driven":
+                return {"skipped": "agent_driven_mode"}
+            
+            from project_memory_mcp.llm_analysis.analyzer import get_analyzer
+            analyzer = get_analyzer(mode="server_driven")
+            
+            if not analyzer._client:
+                analyzer._initialize_client()
+            
+            if not analyzer._client:
+                return {"error": "LLM client not initialized"}
+            
+            # Build context similar to background_analysis.py
+            context = {
+                "task_id": f"file_{file_info.relative_path}",
+                "task_type": "file",
+                "target_path": file_info.relative_path,
+                "file_path": file_info.relative_path,
+                "language": file_info.language or "unknown",
+                "source_code": file_info.path.read_text(encoding="utf-8", errors="replace") if Path(file_info.path).exists() else "",
+                "imports": "",
+                "symbols": "",
+            }
+            
+            # Add static analysis results if available
+            # This would be enhanced with actual static analysis data
+            
+            try:
+                result = await analyzer.analyze("analyze_file", context)
+                return result.model_dump() if result else {"error": "No result"}
+            except Exception as e:
+                return {"error": str(e)}
+
+        parallel_results = await orchestrator.run_full_analysis(
+            analyze_file_func=llm_analyze_file if self.parallel_config.enable_parallel_llm else None
+        )
+
+        # Merge parallel results
+        results.update(parallel_results)
+
+        # Step 3: Create File records and extract static structure (using parallel results)
+        print("Step 3: Creating File records from parallel analysis...")
+        file_infos = self.scanner.scan()  # Re-scan to get file_infos
+        for file_info in file_infos:
+            try:
+                await self._process_file(file_info, results)
+            except Exception as e:
+                results["errors"].append(f"Error processing {file_info.relative_path}: {e}")
+
+        # Step 4: Create analysis tasks for LLM
+        print("Step 4: Creating LLM analysis tasks...")
+        await self._create_analysis_tasks(results)
+
+        # Step 5: Build graph edges (if enabled)
+        if self.auto_build_graph:
+            print("Step 5: Building graph edges...")
+            await self._build_graph_edges()
+
+        # Step 6: Generate manual (if enabled)
+        if self.auto_generate_manual:
+            print("Step 6: Generating PROJECT_AGENT_MANUAL...")
+            await self._generate_manual()
+
+        # Step 7: Refresh the staleness snapshot
+        print("Step 7: Refreshing staleness snapshot...")
+        try:
+            from project_memory_mcp.utils.staleness_checker import refresh_snapshot_async
+
+            await refresh_snapshot_async(self.project_path)
+        except Exception as e:
+            results["errors"].append(f"Error refreshing staleness snapshot: {e}")
+
+        # Record operation
+        await self._record_operation("index", results)
+
+        return results
+
+    async def _execute_sequential(self, results: dict[str, Any]) -> dict[str, Any]:
+        """Execute indexing sequentially (original behavior)."""
         # Step 1: Scan files
         print("Step 1: Scanning files...")
         file_infos = self.scanner.scan()
@@ -123,8 +239,7 @@ class IndexRepositoryWorkflow:
             print("Step 5: Generating PROJECT_AGENT_MANUAL...")
             await self._generate_manual()
 
-        # Step 6: Refresh the staleness snapshot so subsequent tool calls
-        # compare against the freshly-indexed ground truth.
+        # Step 6: Refresh the staleness snapshot
         print("Step 6: Refreshing staleness snapshot...")
         try:
             from project_memory_mcp.utils.staleness_checker import refresh_snapshot_async
@@ -516,36 +631,52 @@ class IndexRepositoryWorkflow:
         )
 
     async def _build_graph_edges(self) -> None:
-        """Build complete graph edges from static and LLM analysis."""
+        """Build complete graph edges from static and LLM analysis.
+
+        IMPORTS/CALLS edges are resolved in place against the file/symbol maps.
+        Multiple unresolved (or freshly resolved) edges from the same source
+        can resolve to the same target; to avoid collapsing them onto the same
+        ``uq_edge_unique`` key we dedup as we go, deleting later losers.
+        """
+        from sqlalchemy import delete, select
+        from project_memory_mcp.workflows.rescan_changed_files import (
+            RescanChangedFilesWorkflow,
+        )
+
         async with get_session() as session:
-            from sqlalchemy import select
+            dedup = RescanChangedFilesWorkflow._dedup_resolve_edges
 
             # Resolve import edges to actual file IDs
-            stmt = select(GraphEdge).where(GraphEdge.edge_type == "IMPORTS")
-            result = await session.execute(stmt)
-            import_edges = result.scalars().all()
-
-            for edge in import_edges:
-                # Try to find target file by module name
-                evidence = edge.evidence or ""
-                module_name = evidence.replace("Import: ", "").strip()
-                target_file_id = self._resolve_import(module_name)
-                if target_file_id:
-                    edge.target_id = target_file_id
-                    edge.confidence = 0.9
+            import_edges = (
+                await session.execute(
+                    select(GraphEdge).where(GraphEdge.edge_type == "IMPORTS")
+                )
+            ).scalars().all()
+            deleted = dedup(
+                import_edges,
+                lambda ev: ev.replace("Import: ", "").strip(),
+                lambda name: self._resolve_import(name),
+            )
+            if deleted:
+                await session.execute(
+                    delete(GraphEdge).where(GraphEdge.id.in_(deleted))
+                )
 
             # Resolve call edges to actual symbol IDs
-            stmt = select(GraphEdge).where(GraphEdge.edge_type == "CALLS")
-            result = await session.execute(stmt)
-            call_edges = result.scalars().all()
-
-            for edge in call_edges:
-                evidence = edge.evidence or ""
-                called_name = evidence.replace("Call to ", "").strip()
-                target_symbol = self.symbol_map.get(called_name)
-                if target_symbol:
-                    edge.target_id = target_symbol["id"]
-                    edge.confidence = 0.9
+            call_edges = (
+                await session.execute(
+                    select(GraphEdge).where(GraphEdge.edge_type == "CALLS")
+                )
+            ).scalars().all()
+            deleted = dedup(
+                call_edges,
+                lambda ev: ev.replace("Call to ", "").strip(),
+                lambda name: self.symbol_map[name]["id"] if name in self.symbol_map else None,
+            )
+            if deleted:
+                await session.execute(
+                    delete(GraphEdge).where(GraphEdge.id.in_(deleted))
+                )
 
             # Add LLM-derived edges
             await self._add_llm_derived_edges(session)
@@ -563,9 +694,8 @@ class IndexRepositoryWorkflow:
 
     async def _add_llm_derived_edges(self, session) -> None:
         """Add edges derived from LLM analysis."""
-        # This would process completed LLMAnalysisRecords and create edges
-        # For equations, variables, dependencies, etc.
-        pass
+        from project_memory_mcp.workflows.rescan_changed_files import add_llm_derived_edges
+        await add_llm_derived_edges(session)
 
     async def _generate_manual(self) -> None:
         """Generate PROJECT_AGENT_MANUAL.md"""

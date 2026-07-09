@@ -106,6 +106,13 @@ class Settings(BaseSettings):
     workflow_auto_build_graph: bool = Field(default=True, description="Automatically build knowledge graph")
     workflow_auto_generate_manual: bool = Field(default=True, description="Automatically generate manual")
 
+    # Parallel analysis configuration
+    parallel_max_workers: int = Field(default=4, description="Max worker threads for parallel static analysis")
+    parallel_max_llm_concurrent: int = Field(default=2, description="Max concurrent LLM calls")
+    parallel_batch_size: int = Field(default=10, description="Batch size for parallel processing")
+    parallel_enable_static: bool = Field(default=True, description="Enable parallel static analysis")
+    parallel_enable_llm: bool = Field(default=True, description="Enable parallel LLM analysis")
+
     @property
     def db_full_path(self) -> str:
         """Get full database path."""
@@ -198,6 +205,19 @@ class Settings(BaseSettings):
                 flattened["workflow_auto_build_graph"] = workflow["auto_build_graph"]
             if "auto_generate_manual" in workflow:
                 flattened["workflow_auto_generate_manual"] = workflow["auto_generate_manual"]
+
+        parallel = data.get("parallel", {})
+        if isinstance(parallel, dict):
+            if "max_workers" in parallel:
+                flattened["parallel_max_workers"] = parallel["max_workers"]
+            if "max_llm_concurrent" in parallel:
+                flattened["parallel_max_llm_concurrent"] = parallel["max_llm_concurrent"]
+            if "batch_size" in parallel:
+                flattened["parallel_batch_size"] = parallel["batch_size"]
+            if "enable_static" in parallel:
+                flattened["parallel_enable_static"] = parallel["enable_static"]
+            if "enable_llm" in parallel:
+                flattened["parallel_enable_llm"] = parallel["enable_llm"]
 
         for key in ("exclude_patterns", "languages", "transport"):
             if key in data:

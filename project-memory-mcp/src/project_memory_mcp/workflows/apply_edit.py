@@ -96,9 +96,8 @@ class ApplyEditWorkflow:
 
         if file_info:
             # This will update the file record and re-extract structure
-            rescan_workflow = RescanChangedFilesWorkflow(self.project_path)
-            # We just need to process this one file
-            pass  # Simplified for now
+            rescan_workflow = RescanChangedFilesWorkflow(self.project_path, config=self.config)
+            await rescan_workflow.execute()
 
         # Record operation
         async with get_session() as session:
@@ -107,8 +106,8 @@ class ApplyEditWorkflow:
                 target_type="file",
                 target_name=file_path,
                 affected_files_json=f'["{file_path}"]',
-                before_hashes_json=f'{{"{file_path}": "{calculate_file_hash(full_path=os.path.join(self.project_path, file_path), content=old_content)}"}}',
-                after_hashes_json=f'{{"{file_path}": "{calculate_file_hash(full_path=os.path.join(self.project_path, file_path), content=new_content)}"}}',
+                before_hashes_json=f'{{"{file_path}": "{calculate_file_hash(file_path=os.path.join(self.project_path, file_path), content=old_content.encode("utf-8"))}"}}',
+                after_hashes_json=f'{{"{file_path}": "{calculate_file_hash(file_path=os.path.join(self.project_path, file_path), content=new_content.encode("utf-8"))}"}}',
                 status="completed",
             )
             session.add(record)

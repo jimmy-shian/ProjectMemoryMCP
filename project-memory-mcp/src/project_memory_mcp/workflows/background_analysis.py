@@ -18,6 +18,7 @@ from project_memory_mcp.db.models import (
     Symbol,
 )
 from project_memory_mcp.llm_analysis.analyzer import get_analyzer
+from project_memory_mcp.static_analysis.file_scanner import FileScanner
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ class BackgroundAnalysisRunner:
         self.last_error = None
         self._task = None
 
-    def start(self, project_path: str) -> str:
+    def start(self, project_path: str, parallel: bool = False) -> str:
         """Spawn the background task if not already running."""
         if self.is_running:
             return "Analysis loop is already running."
@@ -39,27 +40,27 @@ class BackgroundAnalysisRunner:
         self.is_running = True
         self.last_error = None
         self.current_task_id = ""
-        self._task = asyncio.create_task(self._run_loop(project_path))
+        self._task = asyncio.create_task(
+            self._run_loop_parallel(project_path) if parallel else self._run_loop(project_path)
+        )
         return "Started analysis loop in the background."
 
     async def _run_loop(self, project_path: str) -> None:
+        """Run background analysis sequentially (original behavior)."""
         try:
             logger.info("Background analysis loop started.")
             analyzer = get_analyzer(mode="server_driven")
 
             if not analyzer._client:
-                # Re-initialize the LLM client in case settings were updated
                 analyzer._initialize_client()
 
             if not analyzer._client:
                 raise RuntimeError("LLM client not initialized. Check your LLM settings/API keys.")
 
-            # Iterate over each type of analysis layer
             for task_type in ("file", "symbol", "equation"):
                 prompt_name = f"analyze_{task_type}"
 
                 while True:
-                    # Pick next pending record
                     async with get_session() as session:
                         stmt = (
                             select(LLMAnalysisRecord)
@@ -73,14 +74,11 @@ class BackgroundAnalysisRunner:
                         rec = (await session.execute(stmt)).scalar_one_or_none()
 
                         if not rec:
-                            break  # No more pending tasks in this layer
+                            break
 
                         self.current_task_id = f"{task_type}_{rec.target_id}"
                         target_id = rec.target_id
 
-                        # Skip tasks whose target file lives under an archive path.
-                        # Such records are typically stale leftovers from old scans
-                        # and re-analyzing them wastes LLM calls on dead code.
                         if await self._target_is_archived(session, task_type, target_id):
                             rec.status = AnalysisStatus.FAILED.value
                             rec.output_json = json.dumps(
@@ -89,17 +87,14 @@ class BackgroundAnalysisRunner:
                             await session.commit()
                             continue
 
-                        # Build the context
                         context = await self._build_context(session, task_type, target_id, project_path)
 
                         if not context:
-                            # Mark record as failed if target is missing
                             rec.status = AnalysisStatus.FAILED.value
                             rec.output_json = json.dumps({"error": f"{task_type} record missing from database"})
                             await session.commit()
                             continue
 
-                    # Perform LLM analysis outside the database session to avoid holding locks
                     error_msg = ""
                     try:
                         logger.info(f"Analyzing {self.current_task_id} using {analyzer.settings.llm_model}")
@@ -111,18 +106,12 @@ class BackgroundAnalysisRunner:
                         status_ok = False
                         error_msg = str(e)
 
-                    # Persist results in a fresh database session
                     async with get_session() as session:
-                        # Fetch records again in the new session
-                        stmt_rec = select(LLMAnalysisRecord).where(
-                            (LLMAnalysisRecord.target_type == task_type)
-                            & (LLMAnalysisRecord.target_id == target_id)
-                        )
+                        stmt_rec = select(LLMAnalysisRecord).where(LLMAnalysisRecord.id == rec.id)
                         rec_db = (await session.execute(stmt_rec)).scalar_one_or_none()
 
                         if rec_db:
                             if status_ok and result:
-                                # Apply changes to target table
                                 if task_type == "file":
                                     stmt_t = select(File).where(File.id == target_id)
                                     target_rec = (await session.execute(stmt_t)).scalar_one_or_none()
@@ -145,7 +134,7 @@ class BackgroundAnalysisRunner:
                                         target_rec.responsibility = resp
                                         target_rec.side_effects = str(data.get("side_effects", []))
                                         target_rec.confidence = data.get("confidence", 0.0)
-                                else: # equation
+                                else:
                                     stmt_t = select(Equation).where(Equation.id == target_id)
                                     target_rec = (await session.execute(stmt_t)).scalar_one_or_none()
                                     if target_rec:
@@ -169,10 +158,149 @@ class BackgroundAnalysisRunner:
                             else:
                                 rec_db.status = AnalysisStatus.FAILED.value
                                 rec_db.output_json = json.dumps({"error": error_msg if not status_ok else "LLM returned empty result"})
-                            
+
                             await session.commit()
 
             logger.info("Background analysis loop completed successfully.")
+
+        except Exception as exc:
+            self.last_error = f"{exc}\n{traceback.format_exc()}"
+            logger.error(f"Error in background analysis loop: {self.last_error}")
+        finally:
+            self.is_running = False
+            self.current_task_id = ""
+
+    async def _run_loop_parallel(self, project_path: str) -> None:
+        """Run background analysis with parallel LLM calls for same-layer tasks."""
+        try:
+            logger.info("Background analysis loop started (parallel mode).")
+            analyzer = get_analyzer(mode="server_driven")
+
+            if not analyzer._client:
+                analyzer._initialize_client()
+
+            if not analyzer._client:
+                raise RuntimeError("LLM client not initialized. Check your LLM settings/API keys.")
+
+            semaphore = asyncio.Semaphore(2)
+
+            for task_type in ("file", "symbol", "equation"):
+                prompt_name = f"analyze_{task_type}"
+
+                while True:
+                    async with get_session() as session:
+                        stmt = (
+                            select(LLMAnalysisRecord)
+                            .where(
+                                (LLMAnalysisRecord.target_type == task_type)
+                                & (LLMAnalysisRecord.status == AnalysisStatus.PENDING.value)
+                            )
+                            .order_by(LLMAnalysisRecord.id)
+                            .limit(10)
+                        )
+                        records = (await session.execute(stmt)).scalars().all()
+
+                        if not records:
+                            break
+
+                        record_contexts = []
+                        for rec in records:
+                            self.current_task_id = f"{task_type}_{rec.target_id}"
+                            target_id = rec.target_id
+
+                            if await self._target_is_archived(session, task_type, target_id):
+                                rec.status = AnalysisStatus.FAILED.value
+                                rec.output_json = json.dumps(
+                                    {"error": "skipped: target file is under _archive"}
+                                )
+                                await session.commit()
+                                continue
+
+                            context = await self._build_context(session, task_type, target_id, project_path)
+                            if not context:
+                                rec.status = AnalysisStatus.FAILED.value
+                                rec.output_json = json.dumps({"error": f"{task_type} record missing from database"})
+                                await session.commit()
+                                continue
+
+                            record_contexts.append((rec, context))
+
+                        if not record_contexts:
+                            continue
+
+                    async def analyze_one(rec, context):
+                        async with semaphore:
+                            error_msg = ""
+                            try:
+                                logger.info(f"Analyzing {task_type}_{rec.target_id} using {analyzer.settings.llm_model}")
+                                result = await analyzer.analyze(prompt_name, context)
+                                status_ok = bool(result and result.result)
+                            except Exception as e:
+                                logger.error(f"Error during analysis call: {e}")
+                                return rec, None, False, str(e)
+
+                            return rec, result, status_ok, error_msg
+
+                    tasks = [analyze_one(rec, ctx) for rec, ctx in record_contexts]
+                    batch_results = await asyncio.gather(*tasks)
+
+                    async with get_session() as session:
+                        for rec, result, status_ok, error_msg in batch_results:
+                            stmt_rec = select(LLMAnalysisRecord).where(LLMAnalysisRecord.id == rec.id)
+                            rec_db = (await session.execute(stmt_rec)).scalar_one_or_none()
+
+                            if rec_db:
+                                if status_ok and result:
+                                    if task_type == "file":
+                                        stmt_t = select(File).where(File.id == rec.target_id)
+                                        target_rec = (await session.execute(stmt_t)).scalar_one_or_none()
+                                        if target_rec:
+                                            data = result.result or {}
+                                            target_rec.purpose = data.get("purpose", "")
+                                            target_rec.llm_summary = data.get("summary", "")
+                                            target_rec.llm_confidence = data.get("confidence", 0.0)
+                                            target_rec.is_core = data.get("is_core", False)
+                                            target_rec.key_concepts = json.dumps(data.get("key_concepts", []), ensure_ascii=False)
+                                            target_rec.risk_notes = json.dumps(data.get("risk_notes", []), ensure_ascii=False)
+                                            target_rec.analysis_status = AnalysisStatus.COMPLETED.value
+                                    elif task_type == "symbol":
+                                        stmt_t = select(Symbol).where(Symbol.id == rec.target_id)
+                                        target_rec = (await session.execute(stmt_t)).scalar_one_or_none()
+                                        if target_rec:
+                                            data = result.result or {}
+                                            resp = data.get("responsibility", "")
+                                            target_rec.llm_summary = resp
+                                            target_rec.responsibility = resp
+                                            target_rec.side_effects = str(data.get("side_effects", []))
+                                            target_rec.confidence = data.get("confidence", 0.0)
+                                    else:
+                                        stmt_t = select(Equation).where(Equation.id == rec.target_id)
+                                        target_rec = (await session.execute(stmt_t)).scalar_one_or_none()
+                                        if target_rec:
+                                            data = result.result or {}
+                                            target_rec.name = data.get("name", target_rec.name)
+                                            target_rec.equation_type = data.get("equation_type", "unknown")
+                                            target_rec.mathematical_meaning = data.get("mathematical_meaning", "")
+                                            target_rec.physical_meaning = data.get("physical_meaning")
+                                            target_rec.algorithmic_role = data.get("algorithmic_role", "")
+                                            target_rec.inputs_json = json.dumps(data.get("inputs", []))
+                                            target_rec.outputs_json = json.dumps(data.get("outputs", []))
+                                            target_rec.intermediate_variables_json = json.dumps(data.get("intermediate_variables", []))
+                                            target_rec.constants_json = json.dumps(data.get("constants", []))
+                                            target_rec.units_json = json.dumps(data.get("units", {}))
+                                            target_rec.assumptions = str(data.get("assumptions", []))
+                                            target_rec.confidence = data.get("confidence", 0.0)
+
+                                    rec_db.output_json = json.dumps(result.result, ensure_ascii=False)
+                                    rec_db.confidence = result.confidence
+                                    rec_db.status = AnalysisStatus.COMPLETED.value
+                                else:
+                                    rec_db.status = AnalysisStatus.FAILED.value
+                                    rec_db.output_json = json.dumps({"error": error_msg if not status_ok else "LLM returned empty result"})
+
+                        await session.commit()
+
+            logger.info("Background analysis loop completed successfully (parallel).")
 
         except Exception as exc:
             self.last_error = f"{exc}\n{traceback.format_exc()}"
