@@ -615,6 +615,25 @@ async def register_memory_tools(server: Server) -> None:
                     analysis_record.output_json = str(validated.result)
                     analysis_record.confidence = validated.confidence
                     analysis_record.status = AnalysisStatus.COMPLETED.value
+                else:
+                    task = analyzer.create_analysis_task(
+                        task_id=input.task_id,
+                        task_type="file",
+                        target_path=file_record.path,
+                        context={"file_id": file_record.id},
+                    )
+                    analysis_record = LLMAnalysisRecord(
+                        target_type="file",
+                        target_id=file_record.id,
+                        prompt_name=task["prompt_name"],
+                        prompt_version=task["prompt_version"],
+                        model_name=analyzer.settings.llm_model or "unknown",
+                        input_context_hash=task["context_hash"],
+                        output_json=str(validated.result),
+                        confidence=validated.confidence,
+                        status=AnalysisStatus.COMPLETED.value,
+                    )
+                    session.add(analysis_record)
 
                 return SubmitFileAnalysisOutput(
                     accepted=True,
@@ -682,6 +701,26 @@ async def register_memory_tools(server: Server) -> None:
                     analysis_record.output_json = str(validated.result)
                     analysis_record.confidence = validated.confidence
                     analysis_record.status = AnalysisStatus.COMPLETED.value
+                else:
+                    task = analyzer.create_analysis_task(
+                        task_id=input.task_id,
+                        task_type="symbol",
+                        target_path=symbol.qualified_name,
+                        target_name=symbol.name,
+                        context={"symbol_id": symbol.id, "file_id": symbol.file_id},
+                    )
+                    analysis_record = LLMAnalysisRecord(
+                        target_type="symbol",
+                        target_id=symbol_id,
+                        prompt_name=task["prompt_name"],
+                        prompt_version=task["prompt_version"],
+                        model_name=analyzer.settings.llm_model or "unknown",
+                        input_context_hash=task["context_hash"],
+                        output_json=str(validated.result),
+                        confidence=validated.confidence,
+                        status=AnalysisStatus.COMPLETED.value,
+                    )
+                    session.add(analysis_record)
 
                 return SubmitSymbolAnalysisOutput(
                     accepted=True,
@@ -759,6 +798,26 @@ async def register_memory_tools(server: Server) -> None:
                     analysis_record.output_json = str(validated.result)
                     analysis_record.confidence = validated.confidence
                     analysis_record.status = AnalysisStatus.COMPLETED.value
+                else:
+                    task = analyzer.create_analysis_task(
+                        task_id=input.task_id,
+                        task_type="equation",
+                        target_path=equation.name,
+                        target_name=equation.name,
+                        context={"equation_id": equation.id, "file_id": equation.file_id},
+                    )
+                    analysis_record = LLMAnalysisRecord(
+                        target_type="equation",
+                        target_id=eq_id,
+                        prompt_name=task["prompt_name"],
+                        prompt_version=task["prompt_version"],
+                        model_name=analyzer.settings.llm_model or "unknown",
+                        input_context_hash=task["context_hash"],
+                        output_json=str(validated.result),
+                        confidence=validated.confidence,
+                        status=AnalysisStatus.COMPLETED.value,
+                    )
+                    session.add(analysis_record)
 
                 return SubmitEquationAnalysisOutput(
                     accepted=True,
